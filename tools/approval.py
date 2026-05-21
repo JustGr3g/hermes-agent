@@ -970,6 +970,23 @@ def check_all_command_guards(command: str, env_type: str,
         logger.warning("Hardline block: %s (command: %s)", hardline_desc, command[:200])
         return _hardline_block_result(hardline_desc)
 
+    # Framework-upgrade gate: ALSO runs before yolo / mode=off so a
+    # session-level bypass cannot defeat it.  Specifically targets git /
+    # pip / shell-redirect ops that would mutate Athena's own framework
+    # source (gateway/, agent/, tools/, hermes_cli/, etc).  Toggle via
+    # `runtime_flags['framework_upgrade_requires_confirm']` (default ON).
+    # See tools/framework_upgrade_gate.py for full rationale.
+    try:
+        from tools.framework_upgrade_gate import check_command_gate
+        gate_result = check_command_gate(command, env_type)
+        if not gate_result.get("approved", True):
+            return gate_result
+    except Exception as exc:
+        # Gate failure shouldn't crash the approval pipeline.  Log loudly
+        # and fall through — the dangerous-command layer below will still
+        # catch git reset --hard, git push --force, etc.
+        logger.error("framework_upgrade_gate raised: %s", exc, exc_info=True)
+
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()

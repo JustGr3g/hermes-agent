@@ -8,9 +8,13 @@ from dataclasses import dataclass, field
 from typing import Dict
 
 # Tools whose thresholds must never be overridden.
-# read_file=inf prevents infinite persist->read->persist loops.
+# read_file: previously float("inf") to prevent infinite persist->read->persist
+# loops, but that exemption let multi-file reads (read_file x 7) bloat context
+# across iterations because the per-turn aggregate budget couldn't spill them.
+# A finite cap (50_000 chars / ~12.5K tokens) catches genuinely huge files;
+# the loop concern is bounded because each re-read returns a smaller preview.
 PINNED_THRESHOLDS: Dict[str, float] = {
-    "read_file": float("inf"),
+    "read_file": 50_000,
 }
 
 # Defaults matching the current hardcoded values in tool_result_storage.py.

@@ -200,6 +200,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("update", "Update Hermes Agent to the latest version", "Info",
                gateway_only=True),
     CommandDef("debug", "Upload debug report (system info + logs) and get shareable links", "Info"),
+    CommandDef("state", "Show ATHENA cognitive state snapshot (confidence, WM load, goals, signals)", "Info",
+               aliases=("cog",)),
 
     # Exit
     CommandDef("quit", "Exit the CLI", "Exit",

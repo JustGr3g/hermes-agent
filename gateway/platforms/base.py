@@ -2668,6 +2668,13 @@ class BasePlatformAdapter(ABC):
         if not self._message_handler:
             return
 
+        # ── Latency trace: gateway_receive ──
+        try:
+            from _latency_trace import new_turn as _lt_new_turn
+            _lt_new_turn()
+        except Exception:
+            pass
+
         coerce_plaintext_gateway_command(event)
         
         session_key = build_session_key(
@@ -3195,7 +3202,7 @@ class BasePlatformAdapter(ABC):
                     _post_result = _post_cb()
                     if inspect.isawaitable(_post_result):
                         await _post_result
-                except Exception:
+                except (Exception, asyncio.CancelledError):
                     pass
             # Stop typing indicator
             await _stop_typing_task()

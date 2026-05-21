@@ -167,6 +167,8 @@ hermes sessions stats       Session store statistics
 
 ### Cron Jobs
 
+> **Prompt design tip:** When creating cron jobs that deliver summaries (rather than logs), see `references/cron-analytical-prompt-design.md` for the analytical-brief format. The key pattern: declare the format class upfront ("this is an analytical brief, NOT a log"), use section headings that force analysis (What Went Well / What Needs Attention), and include explicit negative rules to suppress itemized listings.
+
 ```
 hermes cron list            List jobs (--all for disabled)
 hermes cron create SCHED    Create: '30m', 'every 2h', '0 9 * * *'

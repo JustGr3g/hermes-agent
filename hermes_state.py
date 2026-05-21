@@ -194,6 +194,7 @@ CREATE TABLE IF NOT EXISTS sessions (
     model TEXT,
     model_config TEXT,
     system_prompt TEXT,
+    cognitive_state TEXT,
     parent_session_id TEXT,
     started_at REAL NOT NULL,
     ended_at REAL,
@@ -746,6 +747,27 @@ class SessionDB:
                 (system_prompt, session_id),
             )
         self._execute_write(_do)
+
+    def update_cognitive_state(self, session_id: str, cognitive_state: str) -> None:
+        """Store serialized ATHENA cognitive bridge state for cross-turn continuity."""
+        def _do(conn):
+            conn.execute(
+                "UPDATE sessions SET cognitive_state = ? WHERE id = ?",
+                (cognitive_state, session_id),
+            )
+        self._execute_write(_do)
+
+    def get_cognitive_state(self, session_id: str) -> Optional[str]:
+        """Retrieve stored cognitive bridge state, or None."""
+        with self._lock:
+            cursor = self._conn.execute(
+                "SELECT cognitive_state FROM sessions WHERE id = ?", (session_id,)
+            )
+            row = cursor.fetchone()
+        if row is None:
+            return None
+        val = row["cognitive_state"] if isinstance(row, sqlite3.Row) else row[0]
+        return str(val) if val else None
 
     def update_token_counts(
         self,

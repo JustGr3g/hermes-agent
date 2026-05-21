@@ -6983,6 +6983,8 @@ class HermesCLI:
             self._handle_copy_command(cmd_original)
         elif canonical == "debug":
             self._handle_debug_command()
+        elif canonical == "state":
+            self._handle_state_command()
         elif canonical == "paste":
             self._handle_paste_command()
         elif canonical == "image":
@@ -8156,6 +8158,71 @@ class HermesCLI:
 
         args = SimpleNamespace(lines=200, expire=7, local=False)
         run_debug_share(args)
+
+    def _handle_state_command(self):
+        """Handle /state — show ATHENA cognitive state snapshot."""
+        from hermes_cli.utils import console
+
+        if not self.agent or not getattr(self.agent, "_cog", None):
+            console.print("[bold yellow](._.) ATHENA cognitive systems not active in this session.[/]")
+            return
+
+        try:
+            from tools.cognitive_introspection_tool import get_current_cog
+
+            cog = get_current_cog()
+            if cog is None:
+                console.print("[bold yellow](._.) CognitiveProcessor reference not available.[/]")
+                return
+            state = cog.cognitive_state
+        except Exception as e:
+            console.print(f"[bold red]Error reading cognitive state:[/] {e}")
+            return
+
+        if not state:
+            console.print("[bold yellow](._.) Cognitive state returned empty.[/]")
+            return
+
+        confidence = state.get("confidence", 0.5)
+        wm_load = state.get("wm_load", 0.0)
+        failure_rate = state.get("failure_rate", 0.0)
+        frustration = state.get("frustration", 0.0)
+        curiosity = state.get("curiosity_level", 0.5)
+        turn_count = state.get("turn_count", 0)
+        signals = state.get("metacognitive_signals", [])
+        goals = state.get("active_goals", [])
+        inner = state.get("inner_speech_winner", "")
+
+        console.print()
+        console.print("[bold cyan]━━━ ATHENA Cognitive State ━━━[/]")
+        console.print(f"[bold]Confidence:[/]    {confidence:.0%}    [bold]WM Load:[/] {wm_load:.0%}")
+        console.print(f"[bold]Failure rate:[/]  {failure_rate:.0%}    [bold]Frustration:[/] {frustration:.2f}")
+        console.print(f"[bold]Curiosity:[/]     {curiosity:.2f}    [bold]Turn count:[/] {turn_count}")
+        if signals:
+            sig_str = ", ".join(s.get("signal", "")[:30] for s in signals[:5])
+            console.print(f"[bold]Signals:[/] {sig_str}")
+        if goals:
+            console.print("[bold]Active goals:[/]")
+            for g in goals[:5]:
+                gid = g.get("id", "")[:8]
+                gcontent = g.get("content", "")[:60]
+                gprio = g.get("priority", 0.5)
+                gstatus = g.get("status", "")
+                console.print(f"  • [{gid}] {gcontent} (p={gprio:.2f}, {gstatus})")
+        if inner:
+            console.print(f"[bold]Inner speech:[/]  \"{inner[:80]}\"")
+        tool_rates = state.get("tool_success_rates", {})
+        if tool_rates:
+            qualified = [
+                (n, d.get("success_rate", 0.5), d.get("n_samples", 0))
+                for n, d in tool_rates.items() if d.get("n_samples", 0) >= 3
+            ]
+            if qualified:
+                qualified.sort(key=lambda x: x[1], reverse=True)
+                parts = [f"{n} {r:.0%} ({c}c)" for n, r, c in qualified]
+                console.print(f"[bold]Tool track record:[/] {', '.join(parts)}")
+        console.print("[bold cyan]━━━━━━━━━━━━━━━━━━━━━━━[/]")
+        console.print()
 
     def _show_usage(self):
         """Show rate limits (if available) and session token usage."""

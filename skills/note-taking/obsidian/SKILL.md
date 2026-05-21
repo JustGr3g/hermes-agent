@@ -1,61 +1,109 @@
 ---
 name: obsidian
-description: Read, search, create, and edit notes in the Obsidian vault.
-platforms: [linux, macos, windows]
+description: Read, search, and create notes in the Obsidian vault.
 ---
 
 # Obsidian Vault
 
-Use this skill for filesystem-first Obsidian vault work: reading notes, listing notes, searching note files, creating notes, appending content, and adding wikilinks.
+**Location:** `OBSIDIAN_VAULT_PATH` is set in Athena's environment via both
+LaunchAgent plists (`ai.athena.server.plist`, `ai.athena.gateway.plist`).
+Always reference it as `$VAULT="$OBSIDIAN_VAULT_PATH"` in commands. Paths
+may contain spaces — always quote them.
 
-## Vault path
+If `OBSIDIAN_VAULT_PATH` is unexpectedly empty, discover the vault with a
+**tightly scoped** probe before falling back. Do NOT use `find ~/` —
+walking the entire home dir times out (3+ minutes observed):
 
-Use a known or resolved vault path before calling file tools.
+```bash
+# Vault roots are the parent dir of any `.obsidian` folder.
+find ~/Documents -maxdepth 3 -name ".obsidian" -type d 2>/dev/null
+```
 
-The documented vault-path convention is the `OBSIDIAN_VAULT_PATH` environment variable, for example from `~/.hermes/.env`. If it is unset, use `~/Documents/Obsidian Vault`.
+## Search rules (avoid the slow paths)
 
-File tools do not expand shell variables. Do not pass paths containing `$OBSIDIAN_VAULT_PATH` to `read_file`, `write_file`, `patch`, or `search_files`; resolve the vault path first and pass a concrete absolute path. Vault paths may contain spaces, which is another reason to prefer file tools over shell commands.
-
-If the vault path is unknown, `terminal` is acceptable for resolving `OBSIDIAN_VAULT_PATH` or checking whether the fallback path exists. Once the path is known, switch back to file tools.
+1. **Always anchor at `$VAULT`** — never `find ~/`, never `find /`.
+2. **For filename keyword search**, prefer `find "$VAULT" -iname "*keyword*"` —
+   `-iname` is case-insensitive, and bounded scope returns in <1s.
+3. **For content search**, use `grep -rli "keyword" "$VAULT" --include="*.md"` —
+   `-l` prints filenames only, much smaller output than full-line `-r`.
+4. **When unsure of the right keyword**, list the structure first
+   (`ls "$VAULT"` or `ls "$VAULT/01-Work"`) before searching. Greg's vault
+   has a deliberate folder structure (e.g. `01-Work/Cresta/`) — listing it
+   often surfaces the right folder faster than keyword search.
+5. **Always set an explicit `timeout`** in the terminal tool when running
+   a `find` you're not certain will be tightly bounded. 30s is reasonable
+   for vault-scoped queries.
 
 ## Read a note
 
-Use `read_file` with the resolved absolute path to the note. Prefer this over `cat` because it provides line numbers and pagination.
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
+cat "$VAULT/Note Name.md"
+```
 
 ## List notes
 
-Use `search_files` with `target: "files"` and the resolved vault path. Prefer this over `find` or `ls`.
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
 
-- To list all markdown notes, use `pattern: "*.md"` under the vault path.
-- To list a subfolder, search under that subfolder's absolute path.
+# In a specific folder (preferred — bounded)
+ls "$VAULT/Subfolder/"
+
+# All notes recursively (use only when you actually need every path)
+find "$VAULT" -name "*.md" -type f
+```
 
 ## Search
 
-Use `search_files` for both filename and content searches. Prefer this over `grep`, `find`, or `ls`.
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
 
-- For filenames, use `search_files` with `target: "files"` and a filename `pattern`.
-- For note contents, use `search_files` with `target: "content"`, the content regex as `pattern`, and `file_glob: "*.md"` when you want to restrict matches to markdown notes.
+# By filename
+find "$VAULT" -name "*.md" -iname "*keyword*"
+
+# By content
+grep -rli "keyword" "$VAULT" --include="*.md"
+```
+
+## Summarize a folder of notes
+
+When the user asks "summarize all notes about X," locate the folder first,
+then read headers in one batch rather than reading each file individually:
+
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
+
+# Find the folder
+find "$VAULT" -type d -iname "*topic*"
+
+# Read first 40 lines of each .md in that folder
+for f in "$VAULT/01-Work/Topic/"*.md; do
+  echo "=== $(basename "$f") ==="
+  head -40 "$f"
+  echo
+done
+```
 
 ## Create a note
 
-Use `write_file` with the resolved absolute path and the full markdown content. Prefer this over shell heredocs or `echo` because it avoids shell quoting issues and returns structured results.
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
+cat > "$VAULT/New Note.md" << 'ENDNOTE'
+# Title
+
+Content here.
+ENDNOTE
+```
 
 ## Append to a note
 
-Prefer a native file-tool workflow when it is not awkward:
-
-- Read the target note with `read_file`.
-- Use `patch` for an anchored append when there is stable context, such as adding a section after an existing heading or appending before a known trailing block.
-- Use `write_file` when rewriting the whole note is clearer than constructing a fragile patch.
-
-For an anchored append with `patch`, replace the anchor with the anchor plus the new content.
-
-For a simple append with no stable context, `terminal` is acceptable if it is the clearest safe option.
-
-## Targeted edits
-
-Use `patch` for focused note changes when the current content gives you stable context. Prefer this over shell text rewriting.
+```bash
+VAULT="$OBSIDIAN_VAULT_PATH"
+echo "
+New content here." >> "$VAULT/Existing Note.md"
+```
 
 ## Wikilinks
 
-Obsidian links notes with `[[Note Name]]` syntax. When creating notes, use these to link related content.
+Obsidian links notes with `[[Note Name]]` syntax. When creating notes, use
+these to link related content.

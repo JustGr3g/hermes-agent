@@ -46,6 +46,64 @@ Use for ANY technical issue:
 - Previous fix didn't work
 - You don't fully understand the issue
 
+
+**Also use this for cognitive architecture self-audit:**
+- Metacognitive signals firing too often or not enough
+- Working memory, motivation, or executive behaving oddly
+- Curious about why a cognitive system makes a particular decision
+- Athena has been running for a while and you want to understand what's actually in memory
+
+When auditing Athena's cognitive architecture specifically:
+1. Read the source code first — `~/cognitive-agent/cognitive_agent/cognition/` has all 8 systems
+2. Check the SQLite DB (`~/athena_memory.db`) for actual state: `episodes`, `metacognitive_events`, `goals`, `pending_reminders`
+3. Compare what the code *should* do vs. what the DB shows it *is* doing
+4. Verify math/computation manually before changing code (e.g. WM load formula)
+5. After fixing, update tests to match the new intended behavior — old tests may be testing old (broken) behavior
+
+### Crucial: Filesystem != Running Process
+
+**Code on disk and running code are two different things.** A fix can be committed to the filesystem but not active if the process hasn't been restarted. This applies to all daemonized services (launchd agents, cron-triggered gateways, heartbeat schedulers).
+
+When investigating a discrepancy between what the code *says* it should do and what behavior you observe:
+
+- **Check the running process** first, not just the file on disk:
+  ```bash
+  # Is the process running on the old or new code?
+  ps aux | grep athena_server | grep -v grep
+  # What launchd service controls it?
+  ls ~/Library/LaunchAgents/ai.athena.*.plist
+  launchctl list | grep athena
+  # Since when has it been running?
+  ps -eo pid,lstart,comm | grep athena
+  ```
+
+- **Check the actual log output** for behavior — the log lines show what the *running* code did, not what the *file* says it should do:
+  ```bash
+  tail -50 ~/cognitive-agent/hermes/logs/athena_server.error.log
+  ```
+
+- **Restart to pick up file changes** after a code fix is applied:
+  ```bash
+  launchctl kickstart gui/501/ai.athena.server   # modern launchctl
+  # or legacy:
+  launchctl unload ~/Library/LaunchAgents/ai.athena.server.plist
+  launchctl load ~/Library/LaunchAgents/ai.athena.server.plist
+  ```
+
+A classic failure mode: you read a `.py` file, see the fix, assume the fix is active. But the Python process loaded the module at startup and hasn't reloaded. The code on disk is the *intended* behavior; the running process is the *actual* behavior. Always verify both before claiming a fix is in effect.
+
+### Crucial: Scoping — Check the Right Codebase
+
+In multi-agent systems (Hermes, Athena, Apollo, Remi), a tool referenced in one agent's registry may not exist in another's. **Always verify the exact codebase path** before concluding something is missing:
+
+- Athena's tools live in `~/cognitive-agent/cognitive_agent/tools/`
+- Hermes' tools live in `~/cognitive-agent/hermes/tools/`
+- Apollo's tools live in `~/.hermes2/tools/`
+
+A claim like "read_vault is registered in the allowlist but doesn't exist" must be verified against the *same codebase* the autonomous loop uses. If Athena's `CognitiveAgent` registers `ReadVaultTool` via `cognitive_agent/agent.py:577`, the fact that it's absent from `hermes/tools/` is irrelevant — Athena's tool dispatcher uses `cognitive_agent/tools/registry.py`, not Hermes'. 
+
+Always trace the **actual dispatch path** (`from .tools.read_vault import ReadVaultTool` in imports, then `self.tools.register(...)`) before making a claim about tool registration.
+
 **Don't skip when:**
 - Issue seems simple (simple bugs have root causes too)
 - You're in a hurry (rushing guarantees rework)

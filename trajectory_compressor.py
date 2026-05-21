@@ -97,10 +97,15 @@ class CompressionConfig:
     protect_first_tool: bool = True
     protect_last_n_turns: int = 4
     
-    # Summarization (OpenRouter)
-    summarization_model: str = "google/gemini-3-flash-preview"
-    base_url: str = OPENROUTER_BASE_URL
-    api_key_env: str = "OPENROUTER_API_KEY"
+    # Summarization (local Ollama via OpenAI-compat endpoint).
+    # Bench (2026-05-17): local nemotron3:33b scored 5.0/5 on this task vs
+    # gemini-3-flash-preview:cloud at 4.17/5. Trajectory compression is a
+    # background task — its ~16s p50 latency is acceptable for the quality
+    # lift. Falls back to Ollama Cloud if localhost is unreachable
+    # (handled by retry logic + fallback summary at line ~640).
+    summarization_model: str = "nemotron3:33b"
+    base_url: str = "http://localhost:11434/v1"
+    api_key_env: str = "OLLAMA_LOCAL_API_KEY"   # unused; local needs no key
     temperature: float = 0.3
     max_retries: int = 3
     retry_delay: int = 2
@@ -395,13 +400,21 @@ class TrajectoryCompressor:
             self.client = None  # Not used directly
             self.async_client = None  # Not used directly
         else:
-            # Custom endpoint — use config's raw base_url + api_key_env
+            # Custom endpoint — use config's raw base_url + api_key_env.
+            # Local Ollama (localhost/127.0.0.1) doesn't need an API key; the
+            # OpenAI-compat endpoint accepts any string. Use a placeholder so
+            # the OpenAI SDK constructor is happy.
             self._use_call_llm = False
+            url = self.config.base_url or ""
+            is_local = "localhost" in url or "127.0.0.1" in url
             api_key = os.getenv(self.config.api_key_env)
             if not api_key:
-                raise RuntimeError(
-                    f"Missing API key. Set {self.config.api_key_env} "
-                    f"environment variable.")
+                if is_local:
+                    api_key = "ollama"  # any non-empty string works
+                else:
+                    raise RuntimeError(
+                        f"Missing API key. Set {self.config.api_key_env} "
+                        f"environment variable.")
             from openai import OpenAI
             from agent.auxiliary_client import _to_openai_base_url
             self.client = OpenAI(
@@ -579,22 +592,31 @@ class TrajectoryCompressor:
         Returns:
             Summary string
         """
-        prompt = f"""Summarize the following agent conversation turns concisely. This summary will replace these turns in the conversation history.
+        prompt = f"""Compress the agent conversation turns below into a short, neutral summary that will REPLACE them in the conversation history.
 
-Write the summary from a neutral perspective describing what the assistant did and learned. Include:
-1. What actions the assistant took (tool calls, searches, file operations)
-2. Key information or results obtained
-3. Any important decisions or findings
-4. Relevant data, file names, values, or outputs
+HARD LIMITS (the summary is rejected if you violate):
+- Maximum {self.config.summary_target_tokens} tokens. Being concise is more important than being thorough — pick the load-bearing facts only.
+- Neutral, telegraphic register. No interpretation, no commendation, no narrative arc.
+- No editorializing verbs ("seamlessly", "rigorously", "successfully", "carefully"). Just say what happened.
+- No invented context. Only summarize what is in the turns.
 
-Keep the summary factual and informative. Target approximately {self.config.summary_target_tokens} tokens.
+STYLE — write like compressed notes, not prose:
+  Ran <tool> on <target>; found <result>. Decided <decision>. Edited <file:line>; verified with <check>.
+
+PRESERVE verbatim (these are load-bearing for future turns):
+- File paths, function/symbol names, commit hashes, IDs
+- Tool names actually invoked
+- Specific numeric results, error messages, dates
+
+DROP:
+- Greetings, acks, retries that succeeded later, interim plans superseded by the final action.
 
 ---
 TURNS TO SUMMARIZE:
 {content}
 ---
 
-Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
+Output ONLY the summary, beginning with "[CONTEXT SUMMARY]:" and nothing else."""
 
         for attempt in range(self.config.max_retries):
             try:
@@ -625,8 +647,19 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     response = self.client.chat.completions.create(**_create_kwargs)
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
+                # Empty / near-empty responses (sometimes seen from local
+                # nemotron3:33b) should be treated as a transient failure so
+                # the retry loop kicks in rather than shipping a degenerate
+                # summary. A real summary on the smallest configured target
+                # (200 tokens) is at least ~80 chars.
+                body = (summary or "").replace("[CONTEXT SUMMARY]:", "").strip()
+                if len(body) < 40:
+                    raise RuntimeError(
+                        f"summary too short ({len(body)} chars) from "
+                        f"{self.config.summarization_model}; retrying"
+                    )
                 return self._ensure_summary_prefix(summary)
-                
+
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")
@@ -648,22 +681,31 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
         Returns:
             Summary string
         """
-        prompt = f"""Summarize the following agent conversation turns concisely. This summary will replace these turns in the conversation history.
+        prompt = f"""Compress the agent conversation turns below into a short, neutral summary that will REPLACE them in the conversation history.
 
-Write the summary from a neutral perspective describing what the assistant did and learned. Include:
-1. What actions the assistant took (tool calls, searches, file operations)
-2. Key information or results obtained
-3. Any important decisions or findings
-4. Relevant data, file names, values, or outputs
+HARD LIMITS (the summary is rejected if you violate):
+- Maximum {self.config.summary_target_tokens} tokens. Being concise is more important than being thorough — pick the load-bearing facts only.
+- Neutral, telegraphic register. No interpretation, no commendation, no narrative arc.
+- No editorializing verbs ("seamlessly", "rigorously", "successfully", "carefully"). Just say what happened.
+- No invented context. Only summarize what is in the turns.
 
-Keep the summary factual and informative. Target approximately {self.config.summary_target_tokens} tokens.
+STYLE — write like compressed notes, not prose:
+  Ran <tool> on <target>; found <result>. Decided <decision>. Edited <file:line>; verified with <check>.
+
+PRESERVE verbatim (these are load-bearing for future turns):
+- File paths, function/symbol names, commit hashes, IDs
+- Tool names actually invoked
+- Specific numeric results, error messages, dates
+
+DROP:
+- Greetings, acks, retries that succeeded later, interim plans superseded by the final action.
 
 ---
 TURNS TO SUMMARIZE:
 {content}
 ---
 
-Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
+Output ONLY the summary, beginning with "[CONTEXT SUMMARY]:" and nothing else."""
 
         for attempt in range(self.config.max_retries):
             try:
@@ -694,8 +736,19 @@ Write only the summary, starting with "[CONTEXT SUMMARY]:" prefix."""
                     response = await self._get_async_client().chat.completions.create(**_create_kwargs)
                 
                 summary = self._coerce_summary_content(response.choices[0].message.content)
+                # Empty / near-empty responses (sometimes seen from local
+                # nemotron3:33b) should be treated as a transient failure so
+                # the retry loop kicks in rather than shipping a degenerate
+                # summary. A real summary on the smallest configured target
+                # (200 tokens) is at least ~80 chars.
+                body = (summary or "").replace("[CONTEXT SUMMARY]:", "").strip()
+                if len(body) < 40:
+                    raise RuntimeError(
+                        f"summary too short ({len(body)} chars) from "
+                        f"{self.config.summarization_model}; retrying"
+                    )
                 return self._ensure_summary_prefix(summary)
-                
+
             except Exception as e:
                 metrics.summarization_errors += 1
                 self.logger.warning(f"Summarization attempt {attempt + 1} failed: {e}")

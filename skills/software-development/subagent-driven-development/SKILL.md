@@ -215,6 +215,8 @@ git add -A && git commit -m "feat: complete [feature name] implementation"
 - Let implementer self-review replace actual review (both are needed)
 - **Start code quality review before spec compliance is PASS** (wrong order)
 - Move to next task while either review has open issues
+- **Broad/investigative subagent tasks without a time budget.** A subagent asked to "validate 10 claims against code" will time out at 600s default. Either scope tasks to narrow claims (1-2 items each, ~5 minute work) or set `max_iterations=200` via the delegate_task parameters if broad coverage is required.
+- **Ship subagent audits without independent verification of critical claims.** Code-defaults-only findings are hypotheses, not facts. Ground every critical finding in live runtime state (a log line, a `grep`, a `ps` readout) yourself before reporting.
 
 ## Handling Issues
 

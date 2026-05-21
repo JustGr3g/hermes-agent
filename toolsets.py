@@ -387,6 +387,39 @@ TOOLSETS = {
         "tools": _HERMES_CORE_TOOLS,
         "includes": []
     },
+
+    # Curated toolset for Athena's Telegram channel — pruned to drop tools
+    # that have zero usage in 69 sessions of telemetry: browser_* (12), TTS,
+    # image_generate, process, clarify, ha_* (4), kanban_* (7). Reduces the
+    # tool-schema footprint in every prompt by ~26 tools / ~16KB to cut
+    # cold-prefill cost on the main model. See feedback_verify_athena_self_reports.md
+    # for context on why we instrumented this in the first place.
+    "hermes-athena-telegram": {
+        "description": "Curated Telegram toolset for Athena - usage-pruned core, drops tools with 0 calls in session telemetry.",
+        "tools": [
+            # Web (kept for current-info queries even though unused recently)
+            "web_search", "web_extract",
+            # Terminal (process dropped — 0 uses)
+            "terminal",
+            # File manipulation (all heavy use)
+            "read_file", "write_file", "patch", "search_files",
+            # Vision (image_generate dropped — 0 uses)
+            "vision_analyze",
+            # Skills (all three see real use)
+            "skills_list", "skill_view", "skill_manage",
+            # Planning & memory
+            "todo", "memory",
+            # Session history search
+            "session_search",
+            # Code execution + delegation (both used)
+            "execute_code", "delegate_task",
+            # Cronjob management (used)
+            "cronjob",
+            # Cross-platform messaging (used 4× in sample)
+            "send_message",
+        ],
+        "includes": []
+    },
     
     "hermes-discord": {
         "description": "Discord bot toolset - full access (terminal has safety checks via dangerous command approval)",

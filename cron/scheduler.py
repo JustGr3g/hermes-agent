@@ -693,7 +693,7 @@ def _get_script_timeout() -> int:
     return _DEFAULT_SCRIPT_TIMEOUT
 
 
-def _run_job_script(script_path: str) -> tuple[bool, str]:
+def _run_job_script(script_path: str, *, stdin_text: Optional[str] = None) -> tuple[bool, str]:
     """Execute a cron job's data-collection script and capture its output.
 
     Scripts must reside within HERMES_HOME/scripts/.  Both relative and
@@ -780,6 +780,7 @@ def _run_job_script(script_path: str) -> tuple[bool, str]:
             text=True,
             timeout=script_timeout,
             cwd=str(path.parent),
+            input=stdin_text if stdin_text is not None else None,
         )
         stdout = (result.stdout or "").strip()
         stderr = (result.stderr or "").strip()
@@ -1556,13 +1557,35 @@ def run_job(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # would otherwise be delivered as if it were the agent's reply and the
         # job's `last_status` set to "ok". Raise so the except handler below
         # builds the proper failure tuple. (issue #17855)
+        #
+        # 2026-05-18 refinement: when the agent did produce a substantive
+        # deliverable in `final_response` (e.g. the daily-summary job that
+        # completes a 1000-word analytical brief but still trips `failed=True`
+        # on a trailing tool-loop hiccup), raising loses the deliverable —
+        # the except handler stuffs the whole summary into `error_msg` and
+        # the user gets it back as "⚠️ Cron job 'X' failed:\nRuntimeError:
+        # ## Daily Summary…". Distinguish: only raise if there's no real
+        # output. If there IS a substantive final_response, prepend a warning
+        # note and let normal delivery proceed.
+        _AGENT_FAILURE_DELIVERABLE_MIN_CHARS = 400
         if result.get("failed") is True or result.get("completed") is False:
-            _err_text = (
-                result.get("error")
-                or (result.get("final_response") or "").strip()
-                or "agent reported failure"
+            _explicit_err = (result.get("error") or "").strip()
+            _final = (result.get("final_response") or "").strip()
+            if _explicit_err or len(_final) < _AGENT_FAILURE_DELIVERABLE_MIN_CHARS:
+                _err_text = _explicit_err or _final or "agent reported failure"
+                raise RuntimeError(_err_text)
+            logger.warning(
+                "Job '%s': agent reported failed=%s/completed=%s but produced "
+                "a substantive final_response (%d chars) — delivering with a "
+                "warning prefix rather than discarding.",
+                job_name, result.get("failed"), result.get("completed"), len(_final),
             )
-            raise RuntimeError(_err_text)
+            _final = (
+                "> ⚠️ Agent flagged the run as failed (likely a trailing "
+                "tool-loop hiccup) but produced the full deliverable below.\n\n"
+                + _final
+            )
+            result = {**result, "final_response": _final}
 
         final_response = result.get("final_response", "") or ""
         # Strip leaked placeholder text that upstream may inject on empty completions.
@@ -1736,6 +1759,32 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 output_file = save_job_output(job["id"], output)
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
+
+                # Optional post-LLM verifier: if the job declares a
+                # `verify_script`, run it with final_response on stdin and
+                # append any non-empty stdout to the deliverable. Used by
+                # the daily-summary job to fact-check numeric claims
+                # against the ground-truth facts sidecar before the
+                # message ships to the user. Failures here are non-fatal —
+                # we still deliver the original response.
+                _verify_script = (job.get("verify_script") or "").strip()
+                if success and _verify_script and final_response:
+                    try:
+                        _vok, _vout = _run_job_script(
+                            _verify_script, stdin_text=final_response
+                        )
+                        if _vok and _vout:
+                            final_response = f"{final_response}\n{_vout}"
+                        elif not _vok:
+                            logger.warning(
+                                "verify_script for job %s failed: %s",
+                                job["id"], _vout,
+                            )
+                    except Exception as ve:
+                        logger.warning(
+                            "verify_script for job %s raised: %s",
+                            job["id"], ve,
+                        )
 
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but

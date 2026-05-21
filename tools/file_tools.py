@@ -795,6 +795,21 @@ def write_file_tool(path: str, content: str, task_id: str = "default") -> str:
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    # Framework-upgrade gate: file writes to gateway/, agent/, tools/,
+    # hermes_cli/, or top-level package files inside HERMES_HOME require
+    # explicit per-call confirmation via Telegram.  ShellFileOperations
+    # writes via `cat > path` go through env.execute() directly (bypassing
+    # _check_all_guards), so this Python-level gate is the only thing
+    # that catches them.  Toggle via runtime_flags.
+    try:
+        from tools.framework_upgrade_gate import check_file_write_gate
+        gate_result = check_file_write_gate(path)
+        if not gate_result.get("approved", True):
+            return tool_error(gate_result.get(
+                "message", "BLOCKED by framework_upgrade_gate"
+            ))
+    except Exception as e:
+        logger.error("framework_upgrade_gate (file write) raised: %s", e, exc_info=True)
     if _is_internal_file_status_text(content):
         return tool_error(
             "Refusing to write internal read_file status text as file content. "

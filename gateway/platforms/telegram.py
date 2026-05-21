@@ -1369,11 +1369,16 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a message to a Telegram chat."""
         if not self._bot:
             return SendResult(success=False, error="Not connected")
-        
+
         # Skip whitespace-only text to prevent Telegram 400 empty-text errors.
         if not content or not content.strip():
             return SendResult(success=True, message_id=None)
-        
+
+        try:
+            from _latency_trace import mark as _lt_mark
+            _lt_mark("send_start")
+        except Exception:
+            _lt_mark = None
         try:
             # Format and split message if needed
             formatted = self.format_message(content)
@@ -1527,13 +1532,16 @@ class TelegramAdapter(BasePlatformAdapter):
                                 continue
                         raise
                 message_ids.append(str(msg.message_id))
-            
+
+            if _lt_mark is not None:
+                try: _lt_mark("send_end")
+                except Exception: pass
             return SendResult(
                 success=True,
                 message_id=message_ids[0] if message_ids else None,
                 raw_response={"message_ids": message_ids}
             )
-            
+
         except Exception as e:
             logger.error("[%s] Failed to send Telegram message: %s", self.name, e, exc_info=True)
             # TimedOut means the request may have reached Telegram —
@@ -1541,6 +1549,9 @@ class TelegramAdapter(BasePlatformAdapter):
             _to = locals().get("_TimedOut")
             err_str = str(e).lower()
             is_timeout = (_to and isinstance(e, _to)) or "timed out" in err_str
+            if _lt_mark is not None:
+                try: _lt_mark("send_end")
+                except Exception: pass
             return SendResult(success=False, error=str(e), retryable=not is_timeout)
 
     async def edit_message(

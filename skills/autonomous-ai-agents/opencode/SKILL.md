@@ -171,23 +171,156 @@ terminal(command="opencode run 'Add parser regression tests and commit'", workdi
 process(action="list")
 ```
 
+## Research-First Delegation Pattern
+
+For maximum reliability, follow this sequence when using OpenCode to fix an existing tool or codebase:
+
+1. **Diagnose in isolation** — Run the tool/code yourself first. Confirm it works when called directly. If it does, the bug is in how it's invoked, not in the tool itself.
+2. **Find the actual gap** — Look at how the tool gets called in production (CognitiveCycle, tool_dispatcher, etc.). The surface-level symptoms (wrong results, empty returns) often point to a different root cause than what you'd guess from reading the tool alone.
+3. **Formulate a targeted prompt** — Include line numbers, the specific constant values, the exact failure mode, and the desired fix in your prompt. Don't say "fix read_vault" — say "line 47: MAX_SCAN_FILES = 2000 but vault has 7515 files, bump to 8000; line 131: tokenizer extracts stopwords, add `_STOPWORDS` filter."
+4. **Delegate** — Send the prompt via `opencode run`. The precise prompt lets OpenCode execute without needing to rediscover the bugs.
+5. **Verify** — After OpenCode completes, run the tool again, run the diagnostics again, confirm the fix actually resolves the production issue.
+
+This pattern avoids the failure mode where OpenCode spends 5+ minutes reading the file, making its own assumptions about what's wrong, and fixing a different class of problem than the one you identified.
+
+### Example: read_vault Tool Fix (May 11, 2026)
+
+The `read_vault` tool was returning irrelevant results for curiosity-driven goals. The workflow:
+
+| Step | What I did | Why |
+|------|-----------|-----|
+| Diagnose | Called `ReadVaultTool.execute({'mode':'search', 'query':'morning routine'})` directly — it worked fine | Ruled out tool-level failure |
+| Find gap | Traced the CognitiveCycle dispatch path — full goal paragraphs were being passed as search queries | Identified two sub-bugs: (1) `MAX_SCAN_FILES=2000` only covered 27% of 7515 vault files, (2) tokenizer extracted meta-words like "analyze" and "synthesize" instead of signal words |
+| Formulate | Wrote prompt with line numbers (47, 131, 166-172), the exact stopword list, and the frontmatter fix | Gave OpenCode everything it needed in one shot |
+| Delegate | `opencode run --format json --dir ... 'Fix read_vault.py...'` | One-shot, no iteration needed |
+| Verify | Re-ran the tool, checked files_scanned (now 2185 after skipping sensitive folders), confirmed excerpt quality | Confirmed the pipeline was now producing useful results |
+
 ## Session & Cost Management
 
 List past sessions:
 
-```
-terminal(command="opencode session list")
-```
+### Provider-Specific Setups
 
-Check token usage and costs:
-
+**OpenRouter / standard providers:**
+```bash
+opencode auth login --provider openrouter --method api-key
 ```
-terminal(command="opencode stats")
-terminal(command="opencode stats --days 7 --models anthropic/claude-sonnet-4")
-```
+Verify: `opencode auth list` should show 1+ credentials.
 
+**Ollama Cloud (custom config):**
+Greg's setup uses a config file at `~/.opencode/config.json` with a custom provider:
+```json
+{
+  "provider": {
+    "ollama-cloud": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Ollama Cloud",
+      "options": {
+        "baseURL": "https://ollama.com/v1",
+        "apiKey": "{env:ATHENA_OLLAMA_API_KEY}"
+      },
+      "models": {
+        "glm-5.1:cloud": {"name": "GLM 5.1 Cloud"},
+        "kimi-k2.6:cloud": {"name": "Kimi K2.6 Cloud"},
+        "deepseek-v4-flash:cloud": {"name": "DeepSeek V4 Flash Cloud"}
+      }
+    }
+  },
+  "model": "ollama-cloud/glm-5.1:cloud"
+}
+```
+Note: `opencode auth list` shows `0 credentials` with this setup — that's expected. The provider config is in the JSON, not auth.json. Use `--model ollama-cloud/<model>` to select the model.
+
+Auth file: `~/.opencode/config.json` (not `~/.local/share/opencode/auth.json`). The env var `ATHENA_OLLAMA_API_KEY` must be set.
+
+---
+
+## Procedure
+
+1. **Verify auth FIRST** — always run before any dispatch:
+   ```bash
+   opencode auth list
+   ```
+   If output shows `0 credentials`, check for `~/.opencode/config.json` with a custom provider config before giving up. The custom-config path does NOT use `opencode auth login`.
+
+2. **Check readiness** (after auth is confirmed):
+   ```bash
+   opencode --version
+   ```
+
+3. **For bounded one-shot tasks**, use `opencode run`. Prefer writing complex prompts to a temp file to avoid shell escaping issues:
+   ```bash
+   # Write prompt to temp file (avoids f-string/quote/special-char parsing issues)
+   terminal(command="opencode run 'Apply changes in /tmp/oc_prompt.md' -f /tmp/oc_prompt.md --format json --thinking")
+   ```
 ## Pitfalls
 
+### OpenCode stalls (May 2026) — ollama-cloud/deepseek-v4-flash
+
+The model can stall in three distinct failure modes:
+
+**A. Large-file reading stall.** Sending a prompt that asks OpenCode to read 14k+ lines of code (e.g. `run_agent.py`) produces a process at 0% CPU that runs 35+ minutes without output. Diagnosis: `ps` shows TIME < 3s even after 30+ min, no output files written, no session log entry.
+
+**B. Multi-file creation stall.** `opencode run` with a prompt requesting 3+ new files via `-f` can stall after the model reads source code but before it finishes writing all files. Observed twice: 4KB prompt for 3 test files stalled at ~300s (wrote 2/3 files), 11KB prompt for 8 files stalled at 300s (wrote 0 files). The model completes the first tool-call batch (reading source) then hangs during the write-or-test-run phase.
+
+**C. Large-file single-edit stall (May 14, 2026).** A prompt targeting a single file of 16k+ lines (`run_agent.py`) timed out at 120s. The model successfully read the file (confirmed in logs) but stalled before writing the edit. **Mitigation: use `patch` instead of OpenCode for targeted edits on files >5k lines.** The `patch` tool handles exact before/after string replacement on large files with lint verification. Only use OpenCode for multi-line additions, new methods, or files under 5k lines.
+
+**Mitigations for all three stall types:**
+1. **Split large prompts into smaller batches.** Write shared infrastructure (conftest, helpers) manually. Dispatch per-file or per-2-file prompts separately.
+2. **Set a wall-clock timeout** (300s) on `opencode run`. If it stalls, kill and fall back to direct `patch()` or `write_file()`.
+3. **For files >5k lines, prefer `patch()` over OpenCode.** The `patch()` tool is deterministic, always succeeds, and has lint verification. OpenCode's stall risk on large files is not worth the convenience.
+4. **Small scope works fine.** The same model completes a targeted 86-line file change in ~40s. The issue is file size, not model availability.
+5. **Recovery when stalled:** `kill <pid>` → `ps aux | grep opencode` to verify cleanup → switch to manual (`patch()` or direct `write_file()`). Don't retry the same prompt.
+
+## Targeted Single-File Edit Pattern (Most Reliable)
+
+Confirmed across 4 consecutive successful dispatches (May 14, 2026): the model handles **single-file targeted edits with exact line numbers and clear before/after code blocks** perfectly and reliably.
+
+**The pattern:**
+1. Write the prompt to a temp file via `write_file()` — NOT as inline terminal args
+2. Include **exact line numbers** for every change location
+3. Provide **the exact before/after code** — do not say "change similarly" or "add analogous code"
+4. Each prompt touches exactly ONE file
+5. Set the timeout to 120s (these complete in 15-40s typically)
+6. Use `--model ollama-cloud/deepseek-v4-flash:cloud --format json`
+
+**Example structure** (from the May 14 branching-flag-implementation prompt):
+```markdown
+## Task: Wire branching flags into loop behavior in run_agent.py
+
+### File to edit
+`/Users/gregdreyfus/cognitive-agent/hermes/run_agent.py`
+
+### Changes needed
+
+**1. Add `_cognitive_advisory` to init block (after line 11540):**
+```python
+        self._repeated_failure = False
+        self._cognitive_advisory = ""  # NEW
+```
+
+**2. Replace the logging-only block (lines 15116-15166) with:**
+[exact replacement code]
+
+**3. Inject `_cognitive_advisory` into ephemeral system prompt.**
+Find the block at approximately line 12156-12160. Add AFTER that block:
+[exact injection code]
+```
+
+**What was delivered in one session (May 14)** using this pattern:
+- Wave 1: tool success rates in cog block (~120 lines in cognitive_processor.py)
+- Wave 2: rich strategic branching (~60 lines in run_agent.py)  
+- Wave 4: cognitive advisory in system prompt (~50 lines in run_agent.py)
+- Tests: branching test expansion (192 additions) + cog block tests
+- All 20 tests passed
+
+**Do NOT** include f-strings, shell expressions, or special characters in the `opencode run` command itself — write them to the prompt file instead.
+- **Inline prompts with f-strings, quotes, or special chars will break shell parsing.** Write the prompt to a temp file via `write_file()` and pass it with `-f`:
+  ```  
+  write_file(path="/tmp/oc_prompt.md", content="...")
+  terminal(command="opencode run 'Apply changes in /tmp/oc_prompt.md' -f /tmp/oc_prompt.md --format json")
+  ```
+  This avoids shell escaping issues entirely.
 - Interactive `opencode` (TUI) sessions require `pty=true`. The `opencode run` command does NOT need pty.
 - `/exit` is NOT a valid command — it opens an agent selector. Use Ctrl+C to exit the TUI.
 - PATH mismatch can select the wrong OpenCode binary/model config.
