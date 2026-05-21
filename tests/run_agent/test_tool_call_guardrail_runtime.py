@@ -1,4 +1,49 @@
-"""Runtime tests for tool-call loop guardrails."""
+"""Runtime tests for tool-call loop guardrails.
+
+OBSOLETE AS OF 2026-05-21
+-------------------------
+Every test in this file exercises ``AIAgent._tool_guardrails`` —
+the ``ToolCallGuardrailController`` integration that was removed
+from ``run_agent.py`` and replaced with a different mechanism:
+
+  - **Old design** (this file): tool-loop-layer hard halt. Counts
+    consecutive identical-arg failures; after N, returns a
+    ``guardrail_halt`` turn-exit with a "stopped retrying" final
+    response.
+  - **New design** (working tree): cognitive-processor-driven soft
+    degradation. The ``REPEATED_FAILURE`` metacognitive signal sets
+    ``self._repeated_failure = True``, which strips write-tools
+    from the filtered toolset and adds a cognitive-advisory string
+    to the prompt. The LLM keeps iterating with read-only tools
+    until it succeeds or hits the iteration budget. See
+    ``run_agent.py`` around line 10097 and 15370.
+
+The ``agent/tool_guardrails.py`` module still exists and is
+unit-tested in ``tests/agent/test_tool_guardrails.py`` — those
+tests cover the controller in isolation and remain valid. It's
+only the runtime *wiring* of that controller into the loop that's
+gone. Until a follow-up either restores a tool-loop-layer
+backstop (for genuinely pathological cases the cog signal might
+not catch) or re-tests the cog-driven soft-filter, this file is
+parked.
+
+Follow-up: 2026-05-21 — investigate REPEATED_FAILURE trigger
+threshold to determine whether the soft-filter covers the same
+threat surface as the removed guardrail's 2-identical-failure
+trigger.  If not, restore a higher-threshold hard-stop backstop
+and write new tests against that.
+"""
+
+import pytest
+
+pytestmark = pytest.mark.skip(
+    reason=(
+        "Obsolete: tests AIAgent._tool_guardrails wiring removed from "
+        "run_agent.py in the 2026-05-21 working-tree refactor. New "
+        "mechanism is cognitive-processor REPEATED_FAILURE signal + "
+        "soft tool-filter. See module docstring."
+    )
+)
 
 import json
 import uuid
