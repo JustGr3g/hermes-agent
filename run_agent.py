@@ -12128,6 +12128,30 @@ class AIAgent:
             except Exception:
                 pass
 
+            # 2026-05-21: progress emit for long-running turns. Median
+            # Telegram turn is 216s (3.6 min) and p90 is 69 min; some
+            # turns run for hours. Users currently see *nothing* between
+            # message-sent and response-received, making healthy long
+            # turns indistinguishable from hangs. Once a turn exceeds 90s
+            # of wall clock, emit a brief "still working" line at most
+            # once per 60s. The throttle prevents Telegram spam on
+            # very long turns; the 90s threshold avoids noise on the
+            # common short-turn case.
+            try:
+                _now_mono = _time_for_cap.monotonic()
+                _elapsed_total = _now_mono - _turn_start_time
+                if _elapsed_total > 90.0:
+                    _last_emit = getattr(self, "_last_progress_emit_at", 0.0)
+                    if (_now_mono - _last_emit) > 60.0:
+                        self._emit_status(
+                            f"⏳ Still working… "
+                            f"(iter {api_call_count}, {_elapsed_total:.0f}s elapsed)"
+                        )
+                        self._last_progress_emit_at = _now_mono
+            except Exception:
+                # progress emit is best-effort — never block iteration
+                pass
+
             # Grace call: the budget is exhausted but we gave the model one
             # more chance.  Consume the grace flag so the loop exits after
             # this iteration regardless of outcome.
