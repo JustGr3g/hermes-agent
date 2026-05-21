@@ -1,0 +1,13 @@
+{
+  "name": "forum",
+  "label": "Forum",
+  "description": "Contemplative real-time visualization of Athena's cognitive state.",
+  "icon": "Eye",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/forum",
+    "position": "after:skills"
+  },
+  "entry": "dist/index.js",
+  "api": "plugin_api.py"
+}

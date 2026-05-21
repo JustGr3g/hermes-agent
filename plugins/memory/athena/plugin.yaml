@@ -1,0 +1,8 @@
+name: athena
+version: 0.1.0
+description: "ATHENA Cognitive Memory — episodic + associative retrieval with spreading activation for cognitive agent systems."
+pip_dependencies:
+  - networkx
+  - httpx
+hooks:
+  - on_session_end

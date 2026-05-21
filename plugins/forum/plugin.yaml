@@ -1,0 +1,6 @@
+manifest_version: 1
+name: forum
+version: 0.1.0
+description: "The Forum — a contemplative real-time visualization of Athena's cognitive state."
+author: Greg Dreyfus
+kind: standalone

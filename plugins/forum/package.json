@@ -1,0 +1,20 @@
+{
+  "name": "@cognitive-agent/hermes-forum-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "description": "The Forum — a contemplative real-time visualization of Athena's cognitive state.",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "build": "node ./scripts/build.mjs",
+    "watch": "node ./scripts/build.mjs --watch"
+  },
+  "dependencies": {
+    "culori": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.0",
+    "esbuild": "^0.27.0",
+    "typescript": "^5.6.3"
+  }
+}

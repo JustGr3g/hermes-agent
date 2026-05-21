@@ -1,0 +1,7 @@
+name: athena
+description: Athena cognitive agent skin
+branding:
+  agent_name: "Athena"
+  welcome: "Athena — cognitive agent with memory, goals, and inner speech."
+  response_label: " 🧠 Athena "
+  prompt_symbol: "🧠 ❯ "

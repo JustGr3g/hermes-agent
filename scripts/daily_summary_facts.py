@@ -1,0 +1,538 @@
+#!/usr/bin/env python3
+"""
+Pre-run facts gatherer for Athena's Daily Autonomous Actions Summary cron.
+
+Athena had been fabricating system facts in her summaries (hallucinated cron
+jobs, message counts off by 5x, non-existent worktrees, fake 503 errors).
+This script gathers ground-truth from the actual DBs/logs and emits it as a
+markdown block that the cron scheduler prepends to the prompt. The cron
+prompt then references THESE facts rather than generating numbers.
+
+Output goes to stdout. The scheduler picks it up via the job's `script`
+field and prepends it as a "## Script Output" section.
+
+Runs in the user's normal environment — no special venv required since
+we only use stdlib + sqlite3.
+"""
+from __future__ import annotations
+
+import datetime
+import glob
+import json
+import os
+import re
+import sqlite3
+import sys
+from collections import Counter
+from pathlib import Path
+
+HOME = Path.home()
+DB = HOME / "athena_memory.db"
+ERROR_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "athena_server.error.log"
+GATEWAY_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "gateway.log"
+CRON_JOBS = HOME / "cognitive-agent" / "hermes" / "cron" / "jobs.json"
+NOTES_DIR = HOME / "cognitive-agent" / "notes"
+BLOCKED_LOG = HOME / "cognitive-agent" / "data" / "blocked_messages.jsonl"
+# Sidecar JSON that verify_summary_numbers.py reads to fact-check the LLM
+# output. Lives next to the script so both halves of the pipeline find it
+# at a stable path without depending on env vars.
+FACTS_JSON = HOME / "cognitive-agent" / "hermes" / "state" / "last_summary_facts.json"
+
+
+def _today_bounds() -> tuple[float, float]:
+    """Return (start, now) epoch — today is local-time 00:00:00 → now."""
+    now = datetime.datetime.now()
+    start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    return (start.timestamp(), now.timestamp())
+
+
+def _yesterday_bounds() -> tuple[float, float]:
+    """Yesterday in local time, full 24h."""
+    now = datetime.datetime.now()
+    today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    yest_start = today_start - datetime.timedelta(days=1)
+    return (yest_start.timestamp(), today_start.timestamp())
+
+
+def _count_loglines(path: Path, date_prefix: str, pattern: str) -> int:
+    """Count log lines matching pattern AND containing date_prefix."""
+    if not path.exists():
+        return 0
+    n = 0
+    try:
+        with open(path, "r", errors="replace") as f:
+            for line in f:
+                if date_prefix in line and pattern in line:
+                    n += 1
+    except Exception:
+        pass
+    return n
+
+
+def gather() -> dict:
+    """Pull every fact we can verify deterministically."""
+    out: dict = {}
+    now = datetime.datetime.now()
+    out["generated_at"] = now.isoformat()
+    today_str = now.strftime("%Y-%m-%d")
+    yesterday_str = (now - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+    # ── Cron jobs that ACTUALLY exist ──────────────────────────────────
+    try:
+        with open(CRON_JOBS) as f:
+            jobs = json.load(f).get("jobs", [])
+        out["cron_jobs"] = [
+            {
+                "id": j["id"],
+                "name": j.get("name", "?"),
+                "schedule": j.get("schedule_display") or j.get("schedule", "?"),
+                "enabled": j.get("enabled", True),
+                "last_status": j.get("last_status"),
+                "last_run_at": j.get("last_run_at"),
+            }
+            for j in jobs
+        ]
+    except Exception as e:
+        out["cron_jobs"] = []
+        out["cron_jobs_error"] = str(e)
+
+    # ── LLM call counts (last 7 days) ──────────────────────────────────
+    out["llm_calls_by_day"] = {}
+    for d in [now - datetime.timedelta(days=i) for i in range(7)]:
+        ds = d.strftime("%Y-%m-%d")
+        out["llm_calls_by_day"][ds] = _count_loglines(
+            ERROR_LOG, ds, "HTTP Request"
+        )
+
+    # ── Inbound Telegram messages (today + yesterday) ──────────────────
+    out["telegram_inbound"] = {
+        today_str: _count_loglines(GATEWAY_LOG, today_str, "inbound message"),
+        yesterday_str: _count_loglines(
+            GATEWAY_LOG, yesterday_str, "inbound message"
+        ),
+    }
+
+    # ── Goal status totals ────────────────────────────────────────────
+    try:
+        conn = sqlite3.connect(DB)
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM goals GROUP BY status"
+        ).fetchall()
+        out["goals_by_status"] = {r[0]: r[1] for r in rows}
+        # Today's goals
+        today_start, _now = _today_bounds()
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM goals WHERE created_at >= ? GROUP BY status",
+            (today_start,),
+        ).fetchall()
+        out["goals_created_today_by_status"] = {r[0]: r[1] for r in rows}
+        # Yesterday's goals
+        yest_start, yest_end = _yesterday_bounds()
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM goals "
+            "WHERE created_at >= ? AND created_at < ? GROUP BY status",
+            (yest_start, yest_end),
+        ).fetchall()
+        out["goals_created_yesterday_by_status"] = {r[0]: r[1] for r in rows}
+        # Recent completed (titles)
+        rows = conn.execute(
+            "SELECT substr(id,1,8), substr(content,1,80) FROM goals "
+            "WHERE status='completed' AND updated_at >= ? "
+            "ORDER BY updated_at DESC LIMIT 10",
+            (today_start - 86400,),  # last 48h
+        ).fetchall()
+        out["recent_completed_goals"] = [{"id": r[0], "content": r[1]} for r in rows]
+        # Recent suspended (with failure rates)
+        rows = conn.execute(
+            "SELECT substr(id,1,8), attempt_count, failure_count, substr(content,1,70) "
+            "FROM goals WHERE status='suspended' "
+            "ORDER BY updated_at DESC LIMIT 6"
+        ).fetchall()
+        out["recent_suspended_goals"] = [
+            {
+                "id": r[0],
+                "attempts": r[1],
+                "failures": r[2],
+                "fail_rate": round(r[2] / r[1], 2) if r[1] else 0,
+                "content": r[3],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        out["goals_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    # ── Tool fire stats (today) ────────────────────────────────────────
+    try:
+        conn = sqlite3.connect(DB)
+        today_start, _now = _today_bounds()
+        rows = conn.execute(
+            "SELECT tool_name, "
+            "  SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, "
+            "  SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS fail, "
+            "  ROUND(AVG(latency_ms), 1) AS avg_ms "
+            "FROM tool_outcomes WHERE timestamp >= ? "
+            "GROUP BY tool_name ORDER BY (ok+fail) DESC",
+            (today_start,),
+        ).fetchall()
+        out["tool_fires_today"] = [
+            {"tool": r[0], "ok": r[1], "fail": r[2], "avg_ms": r[3]} for r in rows
+        ]
+    except Exception as e:
+        out["tool_fires_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    # ── motivation_edit audit (last 24h) ───────────────────────────────
+    # Surfaces every self-driven goal/aspiration edit so drift in goal
+    # intent stays visible. tool_outcomes.args_summary captures the id +
+    # new_content snippet; pairing it with the current goal content gives
+    # a rough before/after.
+    try:
+        conn = sqlite3.connect(DB)
+        cutoff = (now - datetime.timedelta(hours=24)).timestamp()
+        rows = conn.execute(
+            "SELECT timestamp, success, COALESCE(args_summary,'') "
+            "FROM tool_outcomes "
+            "WHERE tool_name='motivation_edit' AND timestamp >= ? "
+            "ORDER BY timestamp DESC LIMIT 20",
+            (cutoff,),
+        ).fetchall()
+        out["motivation_edits_24h"] = [
+            {
+                "at": datetime.datetime.fromtimestamp(r[0]).strftime("%Y-%m-%d %H:%M"),
+                "success": bool(r[1]),
+                "args": r[2][:300],
+            }
+            for r in rows
+        ]
+    except Exception as e:
+        out["motivation_edits_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    # ── TOM blocks today (real count from log) ─────────────────────────
+    out["tom_blocks_today"] = _count_loglines(
+        ERROR_LOG, today_str, "Proactive message blocked by TOM"
+    )
+
+    # ── TOM operating mode (env var; default enforcing) ────────────────
+    # Read from the LaunchAgent plist so we surface the mode the live
+    # server is running in, not whatever env this cron job inherited.
+    out["tom_mode"] = "enforcing"
+    try:
+        import plistlib
+        _plist = Path.home() / "Library" / "LaunchAgents" / "ai.athena.server.plist"
+        if _plist.exists():
+            with open(_plist, "rb") as _pf:
+                _data = plistlib.load(_pf)
+            _env = _data.get("EnvironmentVariables", {}) or {}
+            _mode = (_env.get("ATHENA_TOM_MODE") or "").strip().lower()
+            if _mode:
+                out["tom_mode"] = _mode
+    except Exception as e:
+        out["tom_mode_error"] = str(e)
+
+    # ── Errors / warnings in log today ─────────────────────────────────
+    err_patterns: Counter[str] = Counter()
+    error_examples: list[str] = []
+    if ERROR_LOG.exists():
+        try:
+            with open(ERROR_LOG, "r", errors="replace") as f:
+                for line in f:
+                    if today_str not in line:
+                        continue
+                    if "ERROR" in line or "503" in line or "timeout" in line.lower():
+                        # extract a short signature
+                        if "503" in line:
+                            err_patterns["http_503"] += 1
+                        elif "timeout" in line.lower():
+                            err_patterns["timeout"] += 1
+                        elif "ERROR" in line:
+                            err_patterns["error_other"] += 1
+                        if len(error_examples) < 5:
+                            error_examples.append(line.strip()[:200])
+        except Exception:
+            pass
+    out["errors_today"] = dict(err_patterns)
+    out["error_examples_today"] = error_examples
+
+    # ── Notes saved today ─────────────────────────────────────────────
+    try:
+        today_start, _now = _today_bounds()
+        notes = []
+        for p in sorted(NOTES_DIR.glob("*.md")):
+            mt = p.stat().st_mtime
+            if mt >= today_start:
+                # Strip auto-completion summary notes
+                if "[auto]" in p.name.lower():
+                    continue
+                notes.append(p.name)
+        out["notes_saved_today"] = notes
+    except Exception as e:
+        out["notes_error"] = str(e)
+
+    # ── Blocked-message digest (if exists) ─────────────────────────────
+    # IMPORTANT: these are PROACTIVE OUTBOUND MESSAGES Athena tried to send
+    # Greg that the TOM availability/importance gate suppressed. They are
+    # NOT goal pursuit refusals. The underlying goal in many cases ran
+    # successfully — only the "I'm starting work on X" notification got
+    # suppressed because Greg was asleep / unavailable / the message
+    # importance fell below the current threshold. Mislabelling these as
+    # "blocked auto-triggers" (a goal-pursuit framing) is the recurring
+    # confab pattern from the 2026-05-17 summary. Surface them as what
+    # they are: notification-channel suppressions, working-as-designed.
+    try:
+        if BLOCKED_LOG.exists():
+            with open(BLOCKED_LOG) as f:
+                lines = [json.loads(l) for l in f.readlines() if l.strip()]
+            today_start, _now = _today_bounds()
+            today_blocked = [
+                l for l in lines
+                if l.get("ts", 0) >= today_start
+            ]
+            out["proactive_messages_suppressed_today_count"] = len(today_blocked)
+            # Sample first 5
+            out["proactive_messages_suppressed_today_sample"] = [
+                {
+                    "ts": datetime.datetime.fromtimestamp(l["ts"]).strftime("%H:%M:%S"),
+                    "reason": l.get("reason", "?"),
+                    "importance": l.get("importance"),
+                    "preview": (l.get("message") or "")[:100],
+                }
+                for l in today_blocked[:5]
+            ]
+            # Back-compat alias — older summaries and external code may
+            # still read the old key; keep it pointing at the same data.
+            out["blocked_messages_today_count"] = len(today_blocked)
+            out["blocked_messages_today_sample"] = out[
+                "proactive_messages_suppressed_today_sample"
+            ]
+        else:
+            out["proactive_messages_suppressed_today_count"] = 0
+            out["proactive_messages_suppressed_today_sample"] = []
+            out["blocked_messages_today_count"] = 0
+            out["blocked_messages_today_sample"] = []
+    except Exception as e:
+        out["blocked_messages_error"] = str(e)
+
+    # ── Goal pursuit refusals (cycle-level, separate from message blocks) ──
+    # A goal pursuit refusal is when the cognitive cycle DECLINED to run a
+    # goal — distinct from suppressing the announcement that the goal is
+    # running. Sources: metacognitive_events with type containing
+    # 'self_goal_blocked' / 'pursuit_refused', plus tool_outcomes rows
+    # where tool_name is one of the goal-control tools and success=0 with
+    # an explicit guard reason. Today we expose just the metacog event
+    # count — the cycle code paths that emit these are limited and stable.
+    try:
+        conn = sqlite3.connect(DB)
+        today_start, _now = _today_bounds()
+        rows = conn.execute(
+            "SELECT signal, COUNT(*) FROM metacognitive_events "
+            "WHERE timestamp >= ? AND ("
+            "  signal LIKE '%blocked%' OR signal LIKE '%refused%' "
+            "  OR signal LIKE 'self_goal%' OR signal = 'pursuit_skipped'"
+            ") GROUP BY signal ORDER BY 2 DESC",
+            (today_start,),
+        ).fetchall()
+        out["goal_pursuit_refusals_today"] = {r[0]: r[1] for r in rows}
+        out["goal_pursuit_refusals_today_total"] = sum(r[1] for r in rows)
+    except Exception as e:
+        out["goal_pursuit_refusals_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    return out
+
+
+def render_markdown(facts: dict) -> str:
+    """Render the gathered facts as a markdown block. The cron prompt is
+    instructed to USE these numbers rather than synthesizing them."""
+    lines: list[str] = []
+    lines.append("# Verified System Facts (ground truth — use these, do NOT fabricate)\n")
+    lines.append(f"_Generated: {facts.get('generated_at')}_\n")
+
+    lines.append("## Standing operational reminders\n")
+    lines.append(
+        "- **Note storage:** to record any finding, hypothesis, diagnostic, or "
+        "recommendation, call `save_note` (it writes both the markdown file and "
+        "the `athena_notes` SQLite row automatically). NEVER use terminal+SQL "
+        "to INSERT into a `notes` table — that table does not exist; the real "
+        "table is `athena_notes` and `save_note` is the only correct write path."
+    )
+    lines.append("")
+
+    lines.append("## Cron jobs that exist\n")
+    if facts.get("cron_jobs"):
+        for j in facts["cron_jobs"]:
+            lines.append(
+                f"- `{j['id']}` — {j['name']} — schedule: {j['schedule']} — "
+                f"last_status: {j['last_status']} — last_run_at: {j['last_run_at']}"
+            )
+    else:
+        lines.append(
+            f"- (error reading jobs.json: {facts.get('cron_jobs_error', 'unknown')})"
+        )
+    lines.append("")
+    lines.append(
+        "**IMPORTANT:** This is the COMPLETE list of cron jobs. Do not invent or "
+        "reference cron jobs that are not in this list."
+    )
+    lines.append("")
+
+    lines.append("## LLM call volume (last 7 days)\n")
+    for d, n in facts.get("llm_calls_by_day", {}).items():
+        lines.append(f"- {d}: {n} HTTP/LLM calls")
+    lines.append("")
+
+    lines.append("## Inbound Telegram messages from Greg\n")
+    for d, n in facts.get("telegram_inbound", {}).items():
+        lines.append(f"- {d}: {n} inbound messages")
+    lines.append("")
+
+    lines.append("## Goal status totals (all-time)\n")
+    for s, n in facts.get("goals_by_status", {}).items():
+        lines.append(f"- {s}: {n}")
+    lines.append("")
+
+    lines.append("## Goals created today / yesterday\n")
+    lines.append(f"- Today: {facts.get('goals_created_today_by_status', {})}")
+    lines.append(f"- Yesterday: {facts.get('goals_created_yesterday_by_status', {})}")
+    lines.append("")
+
+    if facts.get("recent_completed_goals"):
+        lines.append("## Recently completed goals (last 48h)\n")
+        for g in facts["recent_completed_goals"]:
+            lines.append(f"- [{g['id']}] {g['content']}")
+        lines.append("")
+
+    if facts.get("recent_suspended_goals"):
+        lines.append("## Recently suspended goals (with fail rates)\n")
+        for g in facts["recent_suspended_goals"]:
+            lines.append(
+                f"- [{g['id']}] attempts={g['attempts']} failures={g['failures']} "
+                f"fail_rate={g['fail_rate']} — {g['content']}"
+            )
+        lines.append("")
+
+    lines.append("## Tool fires today (success / fail / avg latency)\n")
+    for t in facts.get("tool_fires_today", []):
+        lines.append(
+            f"- {t['tool']}: ok={t['ok']} fail={t['fail']} avg_ms={t['avg_ms']}"
+        )
+    lines.append("")
+
+    edits = facts.get("motivation_edits_24h", [])
+    lines.append(f"## Motivation edits (last 24h): {len(edits)}\n")
+    if edits:
+        lines.append(
+            "Each row is an autonomous edit Athena made to her own goals / "
+            "aspirations / tasks via `motivation_edit`. Review for intent drift."
+        )
+        lines.append("")
+        for e in edits:
+            status = "ok" if e["success"] else "FAIL"
+            lines.append(f"- {e['at']} [{status}] {e['args']}")
+        lines.append("")
+
+    _tom_mode = facts.get("tom_mode", "enforcing")
+    lines.append(f"## TOM gate mode: **{_tom_mode}**\n")
+    if _tom_mode == "log_only":
+        lines.append(
+            "TOM is in LOG-ONLY mode. The gate evaluates but never blocks; "
+            "every decision is recorded to blocked_messages.jsonl with a "
+            "`would_have_blocked` flag for weekly review. **Do not propose "
+            "TOM-threshold-diagnosis goals while this mode is active** — "
+            "zero real blocks is expected and intentional."
+        )
+        lines.append("")
+    lines.append(f"## Proactive messages blocked by TOM today: {facts.get('tom_blocks_today', 0)}\n")
+    _suppressed = facts.get(
+        "proactive_messages_suppressed_today_count",
+        facts.get("blocked_messages_today_count", 0),
+    )
+    if _suppressed > 0:
+        lines.append(
+            f"## Proactive notifications suppressed by TOM availability gate "
+            f"today: {_suppressed}\n"
+        )
+        lines.append(
+            "**These are NOTIFICATION-channel suppressions, not goal-pursuit "
+            "refusals.** When the TOM availability gate decides Greg is asleep "
+            "/ unavailable / not receptive, it suppresses the 'I'm starting "
+            "work on X' announcement. The underlying goal in most cases still "
+            "ran — only the proactive message about it got filtered. Do NOT "
+            "frame these as 'blocked auto-triggers' or 'goal pipeline issues' "
+            "in §4 — they are working-as-designed channel suppressions. Goal "
+            "pursuit refusals appear separately below."
+        )
+        lines.append("")
+        for b in facts.get("proactive_messages_suppressed_today_sample", []):
+            lines.append(
+                f"- {b['ts']} — reason={b['reason']} — imp={b['importance']} — "
+                f"preview={b['preview']!r}"
+            )
+        lines.append("")
+
+    _refusals_total = facts.get("goal_pursuit_refusals_today_total", 0)
+    lines.append(
+        f"## Goal pursuit refusals today (cycle-level): {_refusals_total}\n"
+    )
+    if _refusals_total > 0:
+        for k, v in (facts.get("goal_pursuit_refusals_today") or {}).items():
+            lines.append(f"- {k}: {v}")
+        lines.append("")
+    else:
+        lines.append(
+            "- (zero — the cycle did not decline any goal pursuits today)"
+        )
+        lines.append("")
+
+    lines.append("## Errors / timeouts today\n")
+    if facts.get("errors_today"):
+        for k, v in facts["errors_today"].items():
+            lines.append(f"- {k}: {v}")
+        if facts.get("error_examples_today"):
+            lines.append("\nFirst examples:")
+            for ex in facts["error_examples_today"][:3]:
+                lines.append(f"  - {ex}")
+    else:
+        lines.append("- (no errors logged today)")
+    lines.append("")
+
+    lines.append(f"## Notes saved today: {len(facts.get('notes_saved_today', []))}\n")
+    for n in facts.get("notes_saved_today", [])[:5]:
+        lines.append(f"- {n}")
+    lines.append("")
+
+    return "\n".join(lines)
+
+
+def _write_facts_sidecar(facts: dict) -> None:
+    """Persist the gathered facts to a stable path so the post-LLM verifier
+    can cross-check numeric claims without re-querying the source DBs."""
+    try:
+        FACTS_JSON.parent.mkdir(parents=True, exist_ok=True)
+        FACTS_JSON.write_text(json.dumps(facts, default=str, indent=2))
+    except Exception as e:
+        # Don't fail the whole pre-run if sidecar write fails — the
+        # markdown facts still ship to the LLM and the verifier will
+        # just skip with a "facts unavailable" footer.
+        print(f"[warn] failed to write facts sidecar: {e}", file=sys.stderr)
+
+
+def main() -> None:
+    facts = gather()
+    _write_facts_sidecar(facts)
+    md = render_markdown(facts)
+    # Print to stdout for the scheduler to capture.
+    print(md)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,4 @@
+name: athena_telegram_proxy
+version: 2.0.0
+description: "Registers /think and /athena slash commands that proxy to Athena's FastAPI server on :8765. Athena must be running separately."
+author: Greg Dreyfus

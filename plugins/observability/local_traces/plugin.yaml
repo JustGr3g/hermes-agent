@@ -1,0 +1,6 @@
+name: local_traces
+version: "1.0.0"
+description: "Lightweight SQLite-backed LLM call tracing for cost + token analytics. Writes one row per LLM call to ~/cognitive-agent/hermes/traces.db. No external services, no daemons. Sibling to observability/langfuse — pick one."
+author: greg
+hooks:
+  - post_api_request

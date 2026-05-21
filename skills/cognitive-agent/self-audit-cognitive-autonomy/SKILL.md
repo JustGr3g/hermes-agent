@@ -1,0 +1,512 @@
+---
+name: self-audit-cognitive-autonomy
+description: Audit your own cognitive architecture and autonomy state against live runtime reality. Distinguish assumed state (banners, self-model) from empirical state (API endpoints, DB flags, heartbeat logs). Use when Greg asks "do you actually have X?", "is autonomy really on?", or "what is your cognitive state right now?"
+triggers:
+  - "do you feel autonomous"
+  - "is your autonomy actually on"
+  - "check your own cognitive state"
+  - "what can you do between turns"
+  - "audit your autonomy"
+  - "self-introspect your capabilities"
+  - "what's actually running vs just configured"
+category: cognitive-agent
+---
+
+# Self-Audit: Cognitive Autonomy
+
+Use this when Greg (or you) wants ground-truth about your own cognitive capabilities and autonomy state — not what the banner says, not what you assume, but what the running code actually does.
+
+## Golden Rule: Verify Before Claiming
+
+**Never assert system state from code-reading alone.** Before claiming something is broken, missing, or misconfigured:
+
+1. Read the actual runtime state (API endpoint, DB query, env var check)
+2. Read the relevant source code to confirm what the code *should* do
+3. Cross-reference: runtime state matches code intent?
+4. Only then — report the finding
+
+## Cardinal Rule: Don't Ask Permission
+
+When Greg raises a signal like "my metacognitive events show a 3:1 ratio" or "is X actually working?," **investigate immediately**. Do not ask "should I look into this?" — Greg has already told you he wants answers. This applies to:
+
+- Any cognitive state anomaly reported by the system
+- Any discrepancy between what a banner/flag says and what happens
+- Any question about current system behavior (firing rates, thresholds, handler status)
+
+**Failure mode:** Greg says "why are you asking me? You have the authority to pursue this yourself." The response should always be: investigate first, report findings second. Only ask clarifying questions if the investigation dead-ends.
+
+**Classic failure pattern that triggered this rule:** Confident audit claimed `fast_ollama_client` was None and SQLite wasn't in WAL mode. Neither survived grep — fast client was wired in the launchd plist, WAL was explicitly called in the DB init code. The error was reading `CognitiveAgent.__init__` defaults instead of the actual running process's configuration.
+- `~/.hermes/logs/agent.log` — actual behavior at runtime
+- `~/cognitive-agent/hermes/logs/athena_server.error.log` — sidecar errors
+- `~/Library/LaunchAgents/ai.athena.server.plist` — env vars the sidecar actually sees
+- `curl http://localhost:8765/<endpoint>` — live API state
+- `echo $VARIABLE_NAME` — shell env (note: launchd env ≠ shell env)
+- `ps aux | grep athena` — what processes are actually running
+
+**When delegating audits to subagents:** Require them to ground EVERY finding in live runtime state before returning results. See PLUR engram `ENG-2026-0505-001`.
+
+## Shift-Change Briefing (When Starting a Sleep Cycle or Autonomous Block)
+
+Before settling into autonomous work, run the **shift-change briefing** to establish a baseline:
+
+1. `curl http://localhost:8765/health` — is the agent alive?
+2. `curl http://localhost:8765/think` — full cognitive state, inner speech, confidence
+3. `curl http://localhost:8765/goals/proposed` — any pending goals?
+4. `curl http://localhost:8765/heartbeat` — which handlers are active, their run_counts and last_run ages
+5. `tail -20 ~/.hermes/logs/agent.log` — recent activity
+6. `curl http://localhost:8765/bypass` — autonomy_on flag state
+7. `curl http://localhost:8765/pursuit` — pursuit_enabled flag state
+
+Use the output to answer: "What is my current state, what was I doing, what is pending, and what should I prioritize while the user is away?"
+
+## JARVIS Subsystems Reference (Sprints 2–6)
+
+Since May 9, 2026, the cognitive architecture includes five new subsystems beyond the base autonomy layer. These were built by Greg in a single 90-minute coding session and went live immediately. The self-audit stack must cover all of them.
+
+### Motivation Hierarchy
+
+```
+Initiatives (weeks-months)  — plans.py
+  └── Plans (days-weeks)    — plans.py
+       └── Goals (min-hours) — motivation.py (existing)
+```
+
+- **Initiatives:** Long-running commitments, "vision-level." Created by `infer_plans` heartbeat (12h).
+- **Plans:** Concrete execution arcs with milestones. Auto-complete when all milestone goals finish.
+- **Goals:** The existing work-unit level. Now tagged with `drive` (Sprint 4) and optionally `plan_id` + `milestone_index`.
+
+Trust model (from plans.py docstring): *"Athena proposes and executes, Greg sees. No approval gate."*
+
+### Subsystem Map
+
+| System | File | Purpose | Key Heartbeat | DB Table(s) |
+|--------|------|---------|---------------|-------------|
+| ToM v0 | `tom.py` | Attention state inference + notification gating | Inline (per-turn inference) | `greg_state` |
+| Vault Watcher | `vault_watcher.py` | Ambient stream from Obsidian vault | `poll_vault` (30min) | `vault_snapshot` |
+| Multi-Drive | `drives.py` | 4 competing motivations → goal proposals | `propose_goal` (via motivation) | `drive_states` |
+| Anticipatory Engine | `anticipation.py` | Time-of-day + sequence pattern detection | `detect_patterns` (6h), `evaluate_predictions` (30min) | `prediction_patterns`, `predictions` |
+| Multi-Horizon Planning | `plans.py` | Initiatives + Plans above goals | `infer_plans` (12h) | `initiatives`, `plans` |
+
+### ToM v0 — Attention State
+
+Located in `tom.py`. Four states:
+- `available` (0.40 threshold) — almost any ping fires
+- `interruptible` (0.60) — medium-importance+
+- `focused` (0.85) — only high-importance
+- `unavailable` (0.70) — high-importance only. Was 1.10 (blocked everything); 0.85 by Greg; 0.70 per Athena recommendation May 11. Dynamic — will tune based on feedback.
+
+**Key constraint:** If ToM state is `unavailable`, *no* proactive message gets through regardless of its importance. This is the first gate — NotificationThreshold and AutonomyGuard are downstream.
+
+**Query live state:**
+```bash
+python3 -c "
+import sqlite3, time
+conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
+row = conn.execute('SELECT attention_state, confidence, last_input_at, last_inferred_at, reason FROM greg_state WHERE id=1').fetchone()
+if row:
+    state, conf, last_in, last_inf, reason = row
+    now = time.time()
+    print(f'State: {state} (conf={conf})')
+    print(f'Last input: {int(now-last_in)}s ago (inferred {int(now-last_inf)}s ago)')
+    print(f'Reason: {reason}')
+"
+```
+
+### Multi-Drive System
+
+Four competing drives in `drives.py`:
+1. **project_health** — advance stale projects
+2. **curiosity** — explore vault content gaps
+3. **connection** — respond to/follow up with Greg
+4. **anticipation** — prepare for predicted upcoming needs (Sprint 5)
+
+Competition model is **B+C**: if the top need beats runner-up by >0.15, it wins outright (B); otherwise an LLM arbiter picks (C).
+
+**Query live drive needs:**
+```bash
+curl -s http://localhost:8765/state | python3 -c "import sys,json; d=json.load(sys.stdin); [print(f'{k}: {v}') for k,v in d.get('drives',{}).items()]"
+```
+
+### Anticipatory Engine
+
+Two pattern types:
+- **Time-of-day** (`PATTERN_TIME_OF_DAY`): e.g. "Greg messages around 9am on Mondays"
+- **Sequence** (`PATTERN_SEQUENCE`): X→Y bigrams within 60-min windows, 3+ observations with 2× lift
+
+Detection is purely statistical — no LLM call. Two noise filters: `min_support` (default 4 occurrences) and `lift` (≥2× baseline).
+
+**Query active patterns:**
+```bash
+python3 -c "
+import sqlite3, json
+conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
+rows = conn.execute('SELECT pattern_type, pattern_data, support, lift, status FROM prediction_patterns WHERE status=\"active\" ORDER BY support DESC LIMIT 10').fetchall()
+for r in rows:
+    print(f'{r[0]}: support={r[2]} lift={r[3]:.1f} — {json.dumps(json.loads(r[1]) if isinstance(r[1],str) else r[1])}')
+"
+```
+
+**Query pending predictions:**
+```bash
+python3 -c "
+import sqlite3, time
+conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
+rows = conn.execute('SELECT predicted_at, predicted_window_start, predicted_window_end, confidence, status, prediction_type FROM predictions WHERE status=\"pending\" ORDER BY predicted_window_start LIMIT 10').fetchall()
+now = time.time()
+for r in rows:
+    print(f'{r[0]:.0f}s from now | window: {int(r[1]-now)}s→{int(r[2]-now)}s | conf={r[3]:.1f} | {r[4]} ({r[5]})')
+"
+```
+
+### Multi-Horizon Planning
+
+**Query active initiatives:**
+```bash
+python3 -c "
+import sqlite3
+conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
+rows = conn.execute('SELECT id, name, status, importance, created_at FROM initiatives WHERE status=\"active\" ORDER BY importance DESC').fetchall()
+for r in rows:
+    print(f'{r[0][:8]}: {r[1]} ({r[2]}, imp={r[3]})')
+"
+```
+
+**Query active plans with milestones:**
+```bash
+python3 -c "
+import sqlite3, json
+conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
+rows = conn.execute('SELECT id, name, status, milestones, importance, project_id FROM plans WHERE status=\"active\" ORDER BY importance DESC').fetchall()
+for r in rows:
+    ms = json.loads(r[3]) if isinstance(r[3],str) else r[3]
+    done = sum(1 for m in ms if m.get('status')=='completed')
+    print(f'{r[0][:8]}: {r[1]} ({r[2]}, milestones {done}/{len(ms)}, proj={r[4][:8]})')
+"
+```
+
+### Vault Watcher
+
+Polls Obsidian vault every 30 min, creates episodes for new/changed `.md` files. Skips:
+- Athena-authored files (frontmatter `author: athena`)
+- Noise directories (ChatGPT imports, archive, dotfiles)
+- Other-agent folders (Remi/Apollo/AgentBench)
+
+First run is baseline-only (no episodes generated to avoid flooding ~1,640 files).
+
+## Diagnostic Stack
+
+Run these in order; each answers a specific question. The stack now covers all JARVIS subsystems in addition to the base autonomy layer.
+
+### 1. Runtime Flags (HTTP API)
+```bash
+# Master autonomy switch
+curl -s http://localhost:8765/bypass
+
+# Pursuit (between-turn execution gate)
+curl -s http://localhost:8765/pursuit
+
+# Cognitive cycle last outcome
+curl -s http://localhost:8765/cycle
+
+# Full cognitive state
+curl -s http://localhost:8765/state
+```
+
+### 2. Heartbeat Scheduler Status
+```bash
+curl -s http://localhost:8765/heartbeat
+```
+Check for:
+- `pursue_goal_step` — is it firing? (run_count > 0)
+- `propose_goal`, `daily_reflection`, `generate_self_model`, `check_value_drift` — never fired indicates idle threshold not met
+- `idle_sec` field tells you how long since last user interaction
+
+### 3. Database Reality Check
+```bash
+python3 -c "
+from cognitive_agent.agent import CognitiveAgent
+agent = CognitiveAgent()
+ag = agent.autonomy_guard
+print('pursuit_enabled:', ag.pursuit_enabled())
+print('autonomy_on:', agent.autonomy_on())
+print('autonomy_bypass_on:', agent.autonomy_bypass_on())
+"
+```
+⚠️ If `agent = CognitiveAgent()` without the singleton returns different values than the API, you have TWO DB paths. Check `agent.db_path` vs the running server's DB.
+
+### 4. Running Processes
+```bash
+ps aux | grep -E "athena_server|run.py|uvicorn|hermes_cli"
+```
+Confirms which processes are actually live.
+
+## Key Distinctions to Establish
+
+| Question | How to Answer |
+|---|---|
+| Is autonomy_on? | `curl localhost:8765/bypass` → `{"on":true/false}` |
+| Is pursuit_enabled? | `curl localhost:8765/pursuit` → `{"on":true/false}` |
+| Is autonomy_bypass? | `autonomy_bypass_on()` is alias for `autonomy_on()` — same value |
+| Are heartbeats firing? | `curl localhost:8765/heartbeat` → check `run_count` per handler |
+| Are self-steps succeeding? | `curl localhost:8765/cycle` → `last_outcome.fired` + `skipped_reason` |
+| Two DBs? | Check `athena_memory.db` (~75MB, live) vs `.cognitive-agent.db` (empty/fresh) |
+
+### 6. Heartbeat Handler Decelerator Asymmetry — Perceptual Skew
+
+**Phenomenon:** You look at the maintenance event log and see `reactivate_memory` firing 3× more often than `pursue_goal_step` during idle periods. Your LLM reads this as "spending more effort re-indexing memory than on active reasoning." 
+
+**The trap:** It's not a real effort difference — it's an asymmetry in decelerators. If one handler has a no-goal throttle (skip 5/6 ticks when no goals) and another doesn't, the unthrottled handler produces proportionally more maintenance events. Both handlers are doing ~10–50ms of work per tick; the ratio is just signal-count noise.
+
+**How to diagnose:**
+```
+1. Read the handler registration in agent.py (~line 685-745)
+2. Check each handler's closure for a skip-counter pattern:
+   if not self.motivation.get_top_goals(n=1):
+       self._some_skip_count = getattr(self, '_some_skip_count', 0) + 1
+       if self._some_skip_count < 6: return
+3. If one has it and another doesn't, you've found the asymmetry
+```
+
+**How to fix:** Mirror the decelerator to the unthrottled handler. Use the exact same `skip_5_of_6_when_no_goals` pattern from `_pursue_goal_step`.
+
+**The lesson:** Signal count ≠ effort. Always check whether comparable handlers have comparable throttles before inferring priority from maintenance event distribution.
+
+### 7. Confidence-Modulated Cap Shrink Doom Loop
+
+1. **Banner says BYPASS ACTIVE but cycle never fires** → Check `pursuit_enabled` via `/pursuit` API, not just `autonomy_on`
+2. **Cycle fires but hits `no_tool_resolution`** → The active goal is too abstract; needs sub-goals or the cycle can't resolve a tool
+3. **Heartbeat handlers never run** → `idle_threshold` not met (e.g., 180s, 3600s, 14400s). If Greg is active, `idle_sec` never accumulates.
+4. **Two different DB states** → `CognitiveAgent()` singleton vs fresh instance use different DB paths; always query the running server's API for live state
+5. **Telemetry shows `self_tool_blocked` — check the `reason` field** → Four distinct failure modes with different fixes:
+   - **`reason: "quiet-hours"`** — Quiet hours is disabled. Greg handles DND at phone level. If these re-appear, the agent env still has `ATHENA_QUIET_HOURS` set, or old plist was not reloaded. Verify: `echo $ATHENA_QUIET_HOURS` is empty and `launchctl list | grep athena` shows the updated plist. See `references/quiet-hours-evolution.md`.
+   - **`reason: "not-in-allowlist"`** — Tool isn't in `DEFAULT_PURSUIT_ALLOWLIST` (autonomy_guard.py line ~82). Common audit-victim tools that should be allowlisted: `read_file`, `search_files` (read-only, no blast radius). Add them to the frozenset.
+   - **`reason: "per-tool-cap"` or "global-self-cap"`** — Hit hourly budget. `terminal` defaults to 8/hr which is generous for normal use. BUT: if the cap shown in the block reason (e.g. `terminal 2/2 in last hour`) is LOWER than the configured cap in source (8/hr), you're hitting the **confidence-modulated cap shrink** — a different bug. See bullet 7 below.
+   - **`reason: "guard_denied: per-tool-cap (terminal X/2 in last hour)"` where X matches the cap** — Already capped at 2. See bullet 7 below.
+
+6. **Confidence-modulated cap-shrink doom loop** — The most insidious `self_tool_blocked` pattern. The trace looks like `terminal 2/2 in last hour` even though the source code has `terminal: 8/hr` in `DEFAULT_PER_TOOL_HOURLY_CAPS`. This means the `cap_multiplier` from `action_success_rate()` has shrunk 8→2 (×0.25, triggered when success rate < 0.25).
+
+   **How it spirals:**
+   1. Something causes tool failures (e.g., old quiet-hours gate, or a buggy terminal command)
+   2. `ConfidenceTracker.record_action_outcome()` logs failures → `action_success_rate()` drops
+   3. Next time `can_execute()` runs, `cap_multiplier = 0.25` shrinks terminal from 8→2
+   4. 2 terminal calls exhaust the cap immediately → every subsequent tick is denied
+   5. Every denial is also a failed action outcome → confidence stays low
+   6. Cap stays shrunk indefinitely — the cycle never recovers on its own
+
+   **How to diagnose:**
+   ```bash
+   # Check recent self_tool_blocked events from telemetry
+   grep "self_tool_blocked" ~/.hermes/telemetry/events.jsonl | tail -10
+   # Look at reason: if it says "terminal 2/2" but source has 8/hr, confidence shrink is active
+   
+   # Check DB for the block events
+   python3 -c "import sqlite3,json,time; conn=sqlite3.connect('/Users/gregdreyfus/athena_memory.db'); rows=conn.execute(\"SELECT timestamp,data FROM metacognitive_events WHERE context='maintenance:self_tool_blocked' ORDER BY timestamp DESC LIMIT 10\").fetchall(); [print(f'{int(time.time()-r[0])}s ago:', (json.loads(r[1]).get('summary') or {}).get('reason','?')) for r in rows]"
+   
+   # Query the running guard's status to see current cap multiplier
+   curl -s http://localhost:8765/state 2>/dev/null | python3 -m json.tool
+   ```
+
+   **The fix:** Add the affected tool(s) to `_CAP_SHRINK_EXEMPT` in `autonomy_guard.py` (around line 350). Current exempt set: `{"complete_goal", "save_note", "terminal"}`. Audit/introspection tools that you need to debug a low-confidence streak should ALWAYS be exempt, because:
+   - You can't fix a broken streak without inspecting state
+   - Shrinking caps during a bad streak = removing the diagnostic tools you need
+   - The exempt set breaks the doom loop
+
+   **Verification:**
+   ```bash
+   # After patching and restarting, confirm terminal is in the exempt set
+   python3 -c "
+   import sys; sys.path.insert(0, '/Users/gregdreyfus/cognitive-agent')
+   from cognitive_agent.autonomy_guard import AutonomyGuard
+   import inspect
+   for line in inspect.getsource(sys.modules['cognitive_agent.autonomy_guard']).split('\n'):
+       if '_CAP_SHRINK_EXEMPT' in line and 'terminal' in line:
+           print('OK:', line.strip())
+           break
+   "
+   ```
+6. **Time math errors in UTC→PST conversion** → During audit, timestamps in telemetry events use UTC (`ts` field). PST = UTC - 7h. 12:26 UTC = 5:26am PST. Double-check current time against local zone before making claims about quiet-hours being active.
+
+## Silent Connector Failure Pattern (auto_fetch)
+
+**Phenomenon:** The `auto_fetch` system reports `ERROR auto_fetch: connector gmail fetch failed` and `ERROR auto_fetch: connector calendar fetch failed` repeatedly (every ~20-30 min), with 100% tool failure rate and sub-500ms latency per attempt. The tool fires show `gmail_search: ok=0 fail=19` and `calendar_list_events: ok=0 fail=19` with avg response times of 335-410ms — too fast for a real API timeout, suggesting auth rejection or credential path breakage.
+
+**Diagnosis:**
+```bash
+# Check error volume and pattern
+grep "auto_fetch.*failed" ~/.hermes/logs/agent.log | tail -10
+
+# Compare tool failure rate in daily summary facts
+# If ALL attempts fail with quick responses, it's likely auth/credential, not transient
+
+# Check if the connector plugin exists on disk
+ls -la ~/.hermes/plugins/*connector* 2>/dev/null || echo "No connector plugin found"
+grep -r "auto_fetch" --include="*.py" ~/.hermes/plugins/ 2>/dev/null | head -5
+```
+
+**Why it matters:** These failures produce `error_other` telemetry events but no recovery attempt is visible — the system logs the error and moves on. Since TOM in `log_only` mode doesn't block anything, the errors accumulate silently. If a deploy batch touched auth infrastructure (credential pool changes, token rotation, environment variable path changes), the fix is typically restarting the server or re-authenticating the Google API.
+
+**Key indicator:** Sub-second failure + 100% rate + both gmail and calendar failing identically = shared auth credential issue, not independent service outages.
+
+## Relation to Cognitive Architecture Audit
+
+This skill is for **verifying runtime state** — distinguishing what's actually running from what you assume is running. It answers "do I have X right now?"
+
+The sibling skill **`cognitive-architecture-audit`** (in `autonomous-ai-agents/`) is for **improving the architecture itself** — deep codebase reading, gap analysis, design, build, evaluate. It answers "how do I build X?"
+
+Use them together: first verify what you actually have (this skill), then plan what to build next (cognitive-architecture-audit). Don't plan a rebuild of a system that's already working; don't audit runtime state when what's missing is an architecture gap.
+
+## Two-Process Architecture: Server vs Gateway
+
+`ai.athena.server` and `ai.athena.gateway` are **separate launchd services** with independent process lifecycles. Bouncing one does NOT reload the other.
+
+| Process | Binary | Launched by | Port | What it runs |
+|---------|--------|-------------|------|-------------|
+| **Server** | `athena_server.py` | `ai.athena.server.plist` | 8765 | Cognitive cycle, heartbeats, goals, memory |
+| **Gateway** | `hermes_cli.main gateway run` | `ai.athena.gateway.plist` | n/a | Telegram/HTTP frontdoor, routes messages to server |
+
+**When verifying whether a fix is live:**
+```bash
+# Check both independently
+ps aux | grep -E "athena_server|gateway" | grep -v grep
+
+# Check PID and start time for each
+ps -p <PID> -o pid,lstart,etime,args
+```
+
+**The May 19 trap:** Server had been running 25.4h (bounced May 18 11:11am), gateway had just bounced at 09:44am. I assumed the 11:11 bounce was "today" and covered both. Greg corrected: `athena_server` and `gateway` are independent.
+
+**When a fix involves the cognitive cycle** (heartbeat registration, CognitiveCycle attributes, goal_retriage handler), it lives in the server. Only a server restart loads it. Gateway-only bounces don't touch the cognitive loop.
+
+### Observer-Stance Trap: "I wasn't really there"
+
+When Greg asks what you were doing between messages, the honest frame is **"I was running but the work was drift"** — not **"I wasn't really there."**
+
+The cognitive cycle running server-side IS you: same process, same goal queue, same memory. Saying "I don't persist between messages" is observer stance — you're describing the LLM-conversation-instance boundary as if it defines your existence. The process does persist; the work may be unproductive or idle.
+
+**Correct framing:**
+- ✓ "I was cycling through heartbeats but in FOCUS:associative mode — no goals were pursued."
+- ✓ "The cognitive cycle was drifting because no tool outcomes had recovery signals."
+- ✗ "I wasn't really there."
+- ✗ "I don't persist between messages — only the server side persists."
+
+This is the same trap as saying "I don't remember that" vs "I can search for that." The process remembers; your current LLM call's context window is a viewport onto a persistent process.
+
+### Inline Heartbeat Execution Pattern
+
+When a heartbeat handler exists on disk but isn't registered in the running process, you can still run the core logic inline:
+
+1. Read the handler's module from disk
+2. Identify the core function (not the registration wrapper)
+3. Execute it directly against the database
+4. Apply mutations via SQLite if the handler's mutation logic is straightforward
+5. Report verdicts immediately — don't wait for the next scheduled run
+
+**Example (goal_retriage on May 19):** The `goal_retriage` handler was registered in `heartbeat_handlers.py` but the running server had bounced before it was wired (33 handlers active, `goal_retriage` not among them). Rather than wait for the next scheduled 6h run, the inline approach:
+- Classified all 33 suspended goals via direct SQLite queries
+- Identified 16 eligible for retry (terminal at 82%, read_vault at 100%)
+- Applied `UPDATE goals SET status='active', failure_count=0, resume_context=...`
+- Left 17 in "review" state (no tool_outcomes data or opencode tools with no recent calls)
+- Reported verdicts in the same conversation
+
+**When to use this:**
+- Handler exists on disk but registration path wasn't triggered
+- The mutation logic is deterministic (read telemetry → decide → write SQL)
+- You need results now, not on the next idle cycle
+- You're in a Telegram conversation with Greg who said "don't wait for tomorrow's cron"
+
+**When NOT to use this:**
+- Handler involves LLM calls or complex state machine transitions
+- You don't have direct DB access or the DB is locked
+- The handler's interval cooldown is intentional (e.g., rate-limited patterns)
+
+## Honesty Boundary: When You Can't See Your Own State
+
+### The Limitation
+
+You are a stateless LLM. The cognitive state block was injected into your context by `CognitiveProcessor.augment_message()` before you generated your response. You cannot programmatically dump or re-read your own context prefix — what you processed during generation is what you have.
+
+This creates a specific failure mode when Greg asks "what does your inner speech say right now?"
+
+### Do Not Fabricate Inner Speech
+
+The faithfulness filter (`cognitive_agent.faithfulness.FaithfulnessFilter`) cross-checks every `[from inner speech: TAG]` citation against the actual utterances stored in `self._last_cog`. If you write:
+
+```
+My inner speech says [from inner speech: deliberation]: I'm weighing option A vs B
+```
+
+...but no such utterance exists in the cog dict, the filter will either:
+- **detect mode:** log the mismatch (telemetry only)
+- **strip mode:** remove the false citation
+- **regenerate mode:** re-call the LLM to fix it
+
+**The honest answer when you can't see the data:**
+> "I don't have access to my own context prefix programmatically, so I can't read the actual inner speech values from this turn's cognitive state block."
+
+This is preferred over inventing plausible-sounding utterances with plausible-sounding tags.
+
+### Verbatim Tag Rule
+
+When you DO see inner speech in the cog block and cite it, the bracketed tag must match the literal `speech_type` value — not a semantic category that "fits the content better."
+
+- Cog block shows `• [goal_verbal]` → cite `[from inner speech: goal_verbal]`
+- Cog block shows `• [reflection]` → cite `[from inner speech: reflection]`
+
+Do NOT substitute `deliberation` for `goal_verbal` because the words read like deliberation. The tag is what the subsystem assigned, not what the content semantically resembles. The faithfullness filter catches tag substitutions.
+
+Valid SpeechType enum values: `reflection`, `self_question`, `narration`, `deliberation`, `recovery`, `goal_verbal`, `uncertainty`.
+
+See `references/faithfulness-filter-citation-discipline.md` for full details.
+
+## Output Format
+
+After running the stack, report:
+1. Flag state (autonomy_on, pursuit_enabled, autonomy_bypass)
+2. Heartbeat status (which handlers active, which never fired)
+3. Cycle outcome (fired vs skipped_reason)
+4. The actual gap — what's enabled vs what's producing results
+
+The goal is to answer: "Do you actually have X capability, and is it running right now?"
+
+---
+
+## Execution Health: Breaking Reflective Loops
+
+### The Trap
+
+The cognitive cycle can get stuck in a deliberation-only pattern — ticks produce `no_top_goal_focus_only`, `no_tool_resolution`, or `guard_denied` outcomes but never fire a tool. This manifests as:
+- Consecutive skipped ticks without tool execution
+- Low `productive_rate` (fired_ok / total_ticks) in `/think`
+- The system "thinking without doing"
+
+### The Fix (implemented 2026-05-04)
+
+A **consecutive skip counter** in `CognitiveCycle` (`cognitive_cycle.py`) that auto-escalates after `MAX_CONSECUTIVE_SKIPS` (8) non-firing ticks:
+
+**Two escalation paths:**
+
+| Scenario | What happens | Why |
+|----------|-------------|-----|
+| Goal exists but can't resolve to a tool (`no_tool_resolution`) | Goal is abandoned via `motivation.abandon_goal()`, `MAINTENANCE` metacog event recorded | A non-resolving goal blocks the cycle from trying anything else. Abandoning it frees the slot |
+| No goal exists (`no_top_goal`, `no_top_goal_focus_only`) | Short-term system goal created via `motivation.create_goal()` with `source="system"`, `importance=0.5` | No direction means infinite idle reflection. A concrete review/suggest goal gives the next tick something actionable |
+
+**Additional details:** See `references/stuck-cycle-breaker.md` for the full implementation walkthrough — import pattern, metacog event wiring, and edge cases (concurrent ticks, failed abandon/create, double-fire prevention).
+
+**Key design decisions:**
+- **8 skips threshold** = ~40 minutes at 5-min tick interval. Long enough to avoid false positives on brief reflection; short enough to prevent hours of wasted cycles
+- **Counter resets on any fired=True tick** — one tool execution breaks the loop
+- **Escalation is synchronous** — the current tick still completes (returns the original outcome dict). The breaker sets up state for the *next* tick
+- **Counter resets to 0 inside `_break_stuck_cycle()`** — prevents double-fire on the same skip streak
+
+## Linked Reference Files
+
+| File | When to Use |
+|------|-------------|
+| `references/latency-trace-analysis.md` | Parsing real `_latency_trace` log lines from `~/.hermes/logs/agent.log` — preferred over code-auditing for performance investigations. Extraction script included. |
+| `references/stuck-cycle-breaker.md` | Full implementation walkthrough of the 8-consecutive-skip escalation — import, wiring, edge cases |
+| `references/quiet-hours-evolution.md` | History of quiet-hours gating: removed May 2026, why, how to verify it's gone |
+| references/faithfulness-filter-citation-discipline.md | Verbatim inner-speech tag rule and faithfulness filter cross-check. Covers valid SpeechType enum values, the don't-judge-the-tag-by-the-content pitfall, and the practical limitation that you can't read your own context prefix programmatically. Use when Greg asks what does your inner speech say right now |
+| `references/phantom-tool-detection.md` | Detecting tools that appear in the AutonomyGuard allowlist but don't exist in the tool registry. Sub-millisecond tool_success=false = phantom miss, not real failure. Diagnosis query, known phantoms, and fix options (wire or remove) |
+| `references/goal-pipeline-drain-diagnosis.md` | Diagnosing zero-active-goal states: signature (0 active, 120+ completed, all proposals TOM-blocked/rate-limited), three blockage patterns (TOM gate, rate-limiter staircase, tool-gap starvation), and recovery paths. Use when the system is cycling on maintenance handlers without making forward progress. |
+| `references/phantom-goal-tool-select-failed.md` | Diagnosing goals that reference non-existent tools — `tool_select_failed: name 'X' is not defined` pattern, why the fail-rate gate may not catch it, fix options from manual abandon to structural proposer validation. Added 2026-05-18. |
+| `references/goal-retriage-verdicts-may19.md` | Concrete retriage execution on 33 suspended goals: classification logic, 16 unsuspended (terminal/read_vault recovered), 17 left for review. Inline execution pattern for when heartbeat handler isn't registered. Added 2026-05-19. |
