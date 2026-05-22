@@ -22,16 +22,31 @@ The ``agent/tool_guardrails.py`` module still exists and is
 unit-tested in ``tests/agent/test_tool_guardrails.py`` — those
 tests cover the controller in isolation and remain valid. It's
 only the runtime *wiring* of that controller into the loop that's
-gone. Until a follow-up either restores a tool-loop-layer
-backstop (for genuinely pathological cases the cog signal might
-not catch) or re-tests the cog-driven soft-filter, this file is
-parked.
+gone.
 
-Follow-up: 2026-05-21 — investigate REPEATED_FAILURE trigger
-threshold to determine whether the soft-filter covers the same
-threat surface as the removed guardrail's 2-identical-failure
-trigger.  If not, restore a higher-threshold hard-stop backstop
-and write new tests against that.
+RESOLVED: 2026-05-21 — the follow-up investigation completed.
+Findings:
+  - The REPEATED_FAILURE cog signal fires per-Hermes-turn (after
+    3 consecutive low-quality turn outcomes — DecisionMonitor in
+    cognitive_agent/cognition/metacognition.py), NOT per-tool-call.
+    It cannot trip mid-turn, so it does not cover the old
+    guardrail's 2-identical-arg-failure case.
+  - But that case is moot on this system: across 21 days / 58
+    session logs the old guardrail's warn/block markers fired
+    ZERO times, and only 2 turns ever reached even 2 identical-arg
+    failures. The "same args, always fails" tool-spin is not a
+    failure mode Athena actually exhibits.
+  - The pathological multi-hour turns that motivated the audit
+    were provider first-token latency (an Ollama Cloud
+    degradation episode), not tool-loop spins — a guardrail of
+    any threshold would not have caught them.
+
+Decision: the tool-loop-layer guardrail wiring will NOT be
+restored. The real fix is the latency backstop in run_agent.py
+(wall-clock cap hardening + first-content stream deadline +
+latency failover; FailoverReason.slow_provider). This file stays
+skipped as a record of the removed contract; the controller
+module's own unit tests remain the live coverage.
 """
 
 import pytest
@@ -39,9 +54,13 @@ import pytest
 pytestmark = pytest.mark.skip(
     reason=(
         "Obsolete: tests AIAgent._tool_guardrails wiring removed from "
-        "run_agent.py in the 2026-05-21 working-tree refactor. New "
-        "mechanism is cognitive-processor REPEATED_FAILURE signal + "
-        "soft tool-filter. See module docstring."
+        "run_agent.py in the 2026-05-21 refactor. The 2026-05-21 "
+        "follow-up investigation closed RESOLVED — the wiring will not "
+        "be restored (the identical-arg tool-spin it guarded never "
+        "occurs here; the real issue was provider latency, fixed by the "
+        "run_agent.py latency backstop). See module docstring. The "
+        "controller itself stays covered by tests/agent/"
+        "test_tool_guardrails.py."
     )
 )
 

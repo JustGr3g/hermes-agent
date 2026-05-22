@@ -38,6 +38,7 @@ class FailoverReason(enum.Enum):
 
     # Transport
     timeout = "timeout"                  # Connection/read timeout — rebuild client + retry
+    slow_provider = "slow_provider"      # Provider healthy but first-token latency exceeds the deadline repeatedly — rotate to a faster provider
 
     # Context / payload
     context_overflow = "context_overflow"  # Context too large — compress, not failover

@@ -3,7 +3,20 @@ model:
   provider: ollama-cloud
   base_url: https://ollama.com/v1
 providers: {}
-fallback_providers: []
+# Fallback chain (2026-05-21). Tried in order when the primary fails or — once
+# the latency backstop ships — when first-token latency repeatedly exceeds the
+# deadline (FailoverReason.slow_provider). Ranked by the Athena turn-replay A/B:
+# both are fast, clean, ~80% tool-call reliability. Keep deepseek-v4-flash as
+# the primary default — it led the A/B at 92%.
+fallback_providers:
+  - provider: ollama-cloud
+    model: minimax-m2.7:cloud
+    base_url: https://ollama.com/v1
+    key_env: OLLAMA_API_KEY
+  - provider: ollama-cloud
+    model: nemotron-3-super:cloud
+    base_url: https://ollama.com/v1
+    key_env: OLLAMA_API_KEY
 credential_pool_strategies: {}
 toolsets:
 - hermes-cli
@@ -309,6 +322,81 @@ goals:
   max_turns: 20
 skills:
   external_dirs: []
+  # Catalog pruned 2026-05-21. The auto-generated <available_skills> block was
+  # ~120 skills / ~10k chars (53% of the system prompt); an audit of 267 real
+  # turns found 80% of code-modification turns loaded no skill — the maximalist
+  # "scan everything" catalog was self-defeating. Pruned to 29 Athena-relevant
+  # skills (cognitive, software-development, github, obsidian, google-workspace,
+  # opencode, hermes-agent, self-reporting). Disabled skills are hidden from the
+  # catalog AND not loadable via skill_view — re-enable by deleting the name.
+  disabled:
+    - "Skill Factory"
+    - airtable
+    - apple-notes
+    - apple-reminders
+    - architecture-diagram
+    - arxiv
+    - ascii-art
+    - ascii-video
+    - audiocraft-audio-generation
+    - baoyu-comic
+    - baoyu-infographic
+    - blogwatcher
+    - claude-code
+    - claude-design
+    - codex
+    - comfyui
+    - design-md
+    - dogfood
+    - dspy
+    - evaluating-llms-harness
+    - excalidraw
+    - findmy
+    - gif-search
+    - godmode
+    - heartmula
+    - himalaya
+    - huggingface-hub
+    - humanizer
+    - ideation
+    - imessage
+    - jupyter-live-kernel
+    - kanban-orchestrator
+    - kanban-worker
+    - linear
+    - llama-cpp
+    - llm-wiki
+    - macos-computer-use
+    - manim-video
+    - maps
+    - minecraft-modpack-server
+    - nano-pdf
+    - native-mcp
+    - notion
+    - obliteratus
+    - ocr-and-documents
+    - openhue
+    - p5js
+    - pixel-art
+    - pokemon-player
+    - polymarket
+    - popular-web-designs
+    - powerpoint
+    - pretext
+    - research-paper-writing
+    - segment-anything-model
+    - serving-llms-vllm
+    - sketch
+    - songsee
+    - songwriting-and-ai-music
+    - spotify
+    - teams-meeting-pipeline
+    - touchdesigner-mcp
+    - webhook-subscriptions
+    - weights-and-biases
+    - xurl
+    - youtube-content
+    - yuanbao
   template_vars: true
   inline_shell: false
   inline_shell_timeout: 10

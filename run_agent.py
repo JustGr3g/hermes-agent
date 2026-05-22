@@ -7344,6 +7344,13 @@ class AIAgent:
         # poll loop uses this to detect stale connections that keep receiving
         # SSE keep-alive pings but no actual data.
         last_chunk_time = {"t": time.time()}
+        # Wall-clock timestamp when the current stream ATTEMPT started (reset
+        # on each retry).  Unlike last_chunk_time — which resets on every
+        # chunk, including the content-free SSE keep-alives some providers
+        # emit — this is never advanced by keep-alives, so it bounds the
+        # pre-first-token window even when the provider holds the connection
+        # technically alive.
+        stream_attempt_start = {"t": time.time()}
 
         def _fire_first_delta():
             if not first_delta_fired["done"] and on_first_delta:
@@ -7414,6 +7421,7 @@ class AIAgent:
             # Reset stale-stream timer so the detector measures from this
             # attempt's start, not a previous attempt's last chunk.
             last_chunk_time["t"] = time.time()
+            stream_attempt_start["t"] = time.time()
             self._touch_activity("waiting for provider response (streaming)")
             stream = request_client_holder["client"].chat.completions.create(
                 **stream_kwargs
@@ -7998,6 +8006,22 @@ class AIAgent:
             else:
                 _stream_stale_timeout = _stream_stale_timeout_base
 
+        # First-content deadline.  The stale detector above resets its timer on
+        # EVERY chunk, so a provider that holds the SSE stream open with
+        # content-free keep-alives can stall first-token indefinitely without
+        # tripping it — the root cause of the 2026-05 multi-hour Athena turns.
+        # This deadline measures from the stream attempt's start and is NOT
+        # advanced by keep-alives: if no real content (text / reasoning /
+        # tool-call delta) arrives within it, the connection is killed so the
+        # retry loop reconnects fresh and latency failover can trigger.
+        # Disabled for local endpoints, which legitimately take minutes to
+        # prefill large contexts.  Override via HERMES_FIRST_TOKEN_DEADLINE.
+        _first_token_deadline = float(
+            os.getenv("HERMES_FIRST_TOKEN_DEADLINE", 120.0)
+        )
+        if self.base_url and is_local_endpoint(self.base_url):
+            _first_token_deadline = float("inf")
+
         _stream_ctx = contextvars.copy_context()
         t = threading.Thread(target=lambda: _stream_ctx.run(_call), daemon=True)
         t.start()
@@ -8065,6 +8089,55 @@ class AIAgent:
                     f"stale stream detected after {int(_stale_elapsed)}s, reconnecting"
                 )
 
+            # First-content deadline: no real content within the deadline from
+            # this attempt's start.  Distinct from the stale check above —
+            # which the provider's content-free keep-alives keep resetting —
+            # this measures from the attempt start and is not advanced by
+            # keep-alives.  Kill the connection so the retry loop reconnects
+            # fresh; once first content has arrived the stale detector governs.
+            if (
+                not first_delta_fired["done"]
+                and _first_token_deadline != float("inf")
+            ):
+                _ttft_elapsed = time.time() - stream_attempt_start["t"]
+                if _ttft_elapsed > _first_token_deadline:
+                    logger.warning(
+                        "First-content deadline: no tokens for %.0fs "
+                        "(deadline %.0fs) — model=%s. Killing connection.",
+                        _ttft_elapsed,
+                        _first_token_deadline,
+                        api_kwargs.get("model", "unknown"),
+                    )
+                    self._emit_status(
+                        f"⚠️ Provider slow to respond "
+                        f"({int(_ttft_elapsed)}s, no tokens) — reconnecting…"
+                    )
+                    self._stream_latency_kills = (
+                        getattr(self, "_stream_latency_kills", 0) + 1
+                    )
+                    try:
+                        rc = request_client_holder.get("client")
+                        if rc is not None:
+                            self._close_request_openai_client(
+                                rc, reason="first_token_deadline_kill"
+                            )
+                    except Exception:
+                        pass
+                    try:
+                        self._replace_primary_openai_client(
+                            reason="first_token_deadline_pool_cleanup"
+                        )
+                    except Exception:
+                        pass
+                    # Advance attempt-start so we don't kill repeatedly while
+                    # the inner thread processes the closure.
+                    stream_attempt_start["t"] = time.time()
+                    last_chunk_time["t"] = time.time()
+                    self._touch_activity(
+                        f"first-content deadline after {int(_ttft_elapsed)}s, "
+                        "reconnecting"
+                    )
+
             if self._interrupt_requested:
                 try:
                     if self.api_mode == "anthropic_messages":
@@ -8079,6 +8152,31 @@ class AIAgent:
                 except Exception:
                     pass
                 raise InterruptedError("Agent interrupted during streaming API call")
+
+        # Latency failover: if the first-content deadline tripped repeatedly
+        # this turn, the current provider is healthy but too slow. Rotate to
+        # the next entry in the fallback chain so the NEXT iteration's LLM
+        # call uses a faster backend. Fully gated on a configured chain — a
+        # complete no-op while `fallback_providers` is empty. The current
+        # call's return value is unaffected; the swap takes effect next call.
+        try:
+            _lat_kills = getattr(self, "_stream_latency_kills", 0)
+            _lat_after = int(os.getenv("HERMES_LATENCY_FAILOVER_AFTER", "2"))
+            if (
+                _lat_kills >= _lat_after
+                and getattr(self, "_fallback_chain", None)
+                and not getattr(self, "_latency_failover_done", False)
+            ):
+                if self._try_activate_fallback(reason=FailoverReason.slow_provider):
+                    self._latency_failover_done = True
+                    logger.warning(
+                        "Latency failover: %d first-content-deadline kills "
+                        "this turn — switched to fallback model %s.",
+                        _lat_kills, self.model,
+                    )
+        except Exception:
+            logger.debug("latency failover check failed — continuing", exc_info=True)
+
         if result["error"] is not None:
             if deltas_were_sent["yes"]:
                 # Streaming failed AFTER some tokens were already delivered to
@@ -11361,17 +11459,41 @@ class AIAgent:
         if num_tools_seq > 0:
             self._apply_pending_steer_to_tool_results(messages, num_tools_seq)
 
-    def _handle_max_iterations(self, messages: list, api_call_count: int) -> str:
-        """Request a summary when max iterations are reached. Returns the final response text."""
-        print(
-            f"⚠️  Reached maximum iterations ({self.max_iterations}). Requesting summary..."
-        )
+    def _handle_max_iterations(
+        self,
+        messages: list,
+        api_call_count: int,
+        *,
+        reason: str = "max_iterations",
+    ) -> str:
+        """Request a summary when a turn is force-ended. Returns the final
+        response text.
 
-        summary_request = (
-            "You've reached the maximum number of tool-calling iterations allowed. "
-            "Please provide a final response summarizing what you've found and accomplished so far, "
-            "without calling any more tools."
-        )
+        ``reason`` frames the prompt the model sees so the summary is
+        accurate: an iteration-budget exhaustion and a wall-clock-cap hit
+        are different stop conditions. Telling the model it "ran out of
+        iterations" when the turn actually ran out of time skews the
+        summary — so the wall-clock case gets its own framing.
+        """
+        if reason == "wall_clock_cap":
+            print("⏱  Wall-clock time cap reached. Requesting summary...")
+            summary_request = (
+                "This turn has reached its wall-clock time limit. Provide a "
+                "final response summarizing what you've found and accomplished "
+                "so far, and briefly note what still remains unfinished — "
+                "without calling any more tools."
+            )
+        else:
+            print(
+                f"⚠️  Reached maximum iterations ({self.max_iterations}). "
+                "Requesting summary..."
+            )
+            summary_request = (
+                "You've reached the maximum number of tool-calling iterations "
+                "allowed. Please provide a final response summarizing what "
+                "you've found and accomplished so far, without calling any "
+                "more tools."
+            )
         messages.append({"role": "user", "content": summary_request})
 
         try:
@@ -11686,6 +11808,13 @@ class AIAgent:
         self._high_failure_rate = False
         self._repeated_failure = False
         self._cognitive_advisory = ""
+        # Count of first-content-deadline stream kills this turn (set by the
+        # streaming watchdog). Drives the latency-failover trigger; also
+        # surfaced in logs for observability.
+        self._stream_latency_kills = 0
+        # One latency failover per turn — once we've rotated off a slow
+        # provider we don't keep rotating within the same turn.
+        self._latency_failover_done = False
 
         # Pre-turn connection health check: detect and clean up dead TCP
         # connections left over from provider outages or dropped streams.
@@ -12030,7 +12159,32 @@ class AIAgent:
 
             _wall_clock_cap_sec = float(_get_tunable("max_response_seconds"))
         except Exception:
-            _wall_clock_cap_sec = None
+            # Delegate-mode gateway: cognitive_agent is NOT on sys.path here
+            # (cognition runs in the :8765 sidecar via RemoteCognitiveProcessor),
+            # so the tunable import fails. Fall back to the env var directly so
+            # the cap still applies. Unset on vanilla Hermes → stays None → no
+            # cap, preserving the "vanilla Hermes unaffected" design.
+            _env_cap = os.getenv("ATHENA_MAX_RESPONSE_SECONDS")
+            if _env_cap:
+                try:
+                    _wall_clock_cap_sec = float(_env_cap)
+                except ValueError:
+                    _wall_clock_cap_sec = None
+        # Visibility: a silently-None cap is the single highest risk for this
+        # backstop. Emit on the latency-trace channel — it reliably reaches
+        # agent.log per turn, unlike the module logger (whose per-turn INFO is
+        # filtered out). The logger.info stays as a secondary sink for contexts
+        # that do surface it (server-side / non-delegate runs).
+        _cap_status = (
+            f"{_wall_clock_cap_sec:.0f}s" if _wall_clock_cap_sec else "DISABLED"
+        )
+        try:
+            from _latency_trace import mark as _lt_mark
+
+            _lt_mark(f"wall_clock_cap_{_cap_status}")
+        except Exception:
+            pass
+        logger.info("%sturn wall-clock cap: %s", self.log_prefix, _cap_status)
         compression_attempts = 0
         _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
@@ -15233,6 +15387,28 @@ class AIAgent:
                         assistant_message, messages, effective_task_id, api_call_count
                     )
 
+                    # Wall-clock cap re-check. The top-of-loop check alone lets
+                    # one full (potentially 10-30 min) LLM call run past the cap
+                    # before the loop notices. Re-checking here, right after the
+                    # tool calls for this iteration complete, bounds turn
+                    # overrun to a single in-flight call rather than a whole
+                    # extra iteration.
+                    if _wall_clock_cap_sec is not None:
+                        _cap_elapsed = (
+                            _time_for_cap.monotonic() - _turn_start_time
+                        )
+                        if _cap_elapsed > _wall_clock_cap_sec:
+                            _turn_exit_reason = "wall_clock_cap"
+                            if not self.quiet_mode:
+                                self._safe_print(
+                                    f"\n⏱  Wall-clock cap hit "
+                                    f"({_cap_elapsed:.0f}s > "
+                                    f"{_wall_clock_cap_sec:.0f}s) after "
+                                    f"{api_call_count} API calls "
+                                    f"(post-tool-exec) — exiting loop."
+                                )
+                            break
+
                     # Reset per-turn retry counters after successful tool
                     # execution so a single truncation doesn't poison the
                     # entire conversation.
@@ -15819,7 +15995,9 @@ class AIAgent:
                 self._safe_print(
                     f"\n⏱  Wall-clock cap recovery — requesting summary..."
                 )
-            final_response = self._handle_max_iterations(messages, api_call_count)
+            final_response = self._handle_max_iterations(
+                messages, api_call_count, reason="wall_clock_cap"
+            )
 
         if final_response is None and (
             api_call_count >= self.max_iterations
