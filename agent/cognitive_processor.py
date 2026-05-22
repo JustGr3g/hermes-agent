@@ -286,7 +286,11 @@ class CognitiveProcessor:
             cog = self._turn_cog_cache
         else:
             try:
-                cog = ca.run(user_message=text_content, image_b64=image_b64)
+                cog = ca.run(
+                    user_message=text_content,
+                    image_b64=image_b64,
+                    allow_tools=False,
+                )
             except Exception as e:
                 logger.debug("[ATHENA] ca.run() failed: %s", e)
                 return api_msg
