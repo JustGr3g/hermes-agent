@@ -12480,16 +12480,29 @@ class AIAgent:
                     self._sanitize_tool_calls_for_strict_api(api_msg)
                 # Keep 'reasoning_details' - OpenRouter uses this for multi-turn reasoning context
                 # The signature field helps maintain reasoning continuity
-                api_messages.append(api_msg)
 
                 # ── ATHENA: cognitive perception layer ─────────────────────
-                # Phase 1: lightweight echo (processor attached).
-                # Phase 3+: full Perception → WM → Metacognition pipeline.
-                if self._cog is not None:
+                # Perception processes the NEW user input, so gate this to the
+                # current turn's user message. Without the gate the call fans
+                # out to one sidecar round-trip per history message per agent
+                # iteration — O(messages × iterations), ~1000 augment POSTs and
+                # ~250s of dead latency per turn before the real LLM call.
+                #
+                # augment_message must run BEFORE the append: in delegate mode
+                # it returns a *fresh* dict (deserialized from the sidecar's
+                # HTTP response), not an in-place mutation. Appending first and
+                # then rebinding api_msg would discard the augmented copy — the
+                # cognitive-state block would never reach the request.
+                if (
+                    self._cog is not None
+                    and idx == current_turn_user_idx
+                    and msg.get("role") == "user"
+                ):
                     try:
                         api_msg = self._cog.augment_message(api_msg)
                     except Exception as _cog_e:
                         logger.debug("[ATHENA] augment_message error: %s", _cog_e)
+                api_messages.append(api_msg)
 
             # Build the final system message: cached prompt + ephemeral system prompt.
             # Ephemeral additions are API-call-time only (not persisted to session DB).
