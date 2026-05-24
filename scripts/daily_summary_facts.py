@@ -54,6 +54,25 @@ def _yesterday_bounds() -> tuple[float, float]:
     return (yest_start.timestamp(), today_start.timestamp())
 
 
+_WEEKDAY_SHORT = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
+
+
+def _weekday_label(date_str: str) -> str:
+    """Map YYYY-MM-DD → short weekday name. Returns '?' on parse failure.
+
+    Added 2026-05-24 after Athena's morning summary repeatedly mis-
+    attributed peak-day labels (e.g. called 2026-05-20 'Tuesday' when
+    Tuesday was 2026-05-19). The dates and numbers were already correct
+    in this script's output — the LLM was guessing the day-of-week. By
+    rendering it explicitly, the LLM has no reason to guess.
+    """
+    try:
+        dt = datetime.datetime.strptime(date_str, "%Y-%m-%d")
+        return _WEEKDAY_SHORT[dt.weekday()]
+    except Exception:
+        return "?"
+
+
 def _count_loglines(path: Path, date_prefix: str, pattern: str) -> int:
     """Count log lines matching pattern AND containing date_prefix."""
     if not path.exists():
@@ -387,12 +406,18 @@ def render_markdown(facts: dict) -> str:
 
     lines.append("## LLM call volume (last 7 days)\n")
     for d, n in facts.get("llm_calls_by_day", {}).items():
-        lines.append(f"- {d}: {n} HTTP/LLM calls")
+        lines.append(f"- {d} ({_weekday_label(d)}): {n} HTTP/LLM calls")
+    lines.append(
+        "\n_Day-of-week labels above are computed from the date — when "
+        "writing the summary, refer to peak days by these labels rather "
+        "than guessing (e.g. if 2026-05-20 (Wed) is the highest, write "
+        '"Wednesday peaked", not "Tuesday peaked")._'
+    )
     lines.append("")
 
     lines.append("## Inbound Telegram messages from Greg\n")
     for d, n in facts.get("telegram_inbound", {}).items():
-        lines.append(f"- {d}: {n} inbound messages")
+        lines.append(f"- {d} ({_weekday_label(d)}): {n} inbound messages")
     lines.append("")
 
     lines.append("## Goal status totals (all-time)\n")
