@@ -9,8 +9,8 @@ The drained-pipeline state is **not** the same as "the system is idle." It has a
 | Surface | Healthy | Drained |
 |---------|---------|---------|
 | `goals` table | 1-5 active goals, mix of statuses | 0 active, 120+ completed, 20+ abandoned |
-| `propose_goal` heartbeat | Creates new goals regularly | Runs but skips (rate-limited or TOM-blocked) |
-| Proactive message log | Messages reaching user | All blocked by TOM (`imp < threshold`) |
+| `propose_goal` heartbeat | Creates new goals regularly | Runs but skips (rate-limited or no_top_goal) |
+| Proactive message log | Messages reaching user | All blocked by quiet-hours or rate-limit |
 
 ## Diagnostic Queries
 
@@ -34,18 +34,6 @@ Look for:
 - `not created — reason='no-drive-above-threshold'` — drive competition produced nothing
 - No log line at all — propose_goal may not be running
 
-### 3. TOM Gate State
-```bash
-python3 -c "
-import sqlite3, time
-conn = sqlite3.connect('/Users/gregdreyfus/athena_memory.db')
-row = conn.execute('SELECT attention_state, confidence, reason FROM greg_state WHERE id=1').fetchone()
-if row:
-    print(f'TOM state: {row[0]} (conf={row[1]})')
-    print(f'Reason: {row[2]}')
-"
-```
-
 ### 4. Recent Goal Completes With No Active Replacements
 ```bash
 python3 -c "
@@ -59,13 +47,6 @@ for r in rows:
 ```
 
 ## Common Blockage Patterns
-
-### Pattern A: TOM Gate Block
-- Symptoms: `propose_goal` creates goals with importance 0.6-0.8, but TOM threshold is higher than the observed importance range and state is `unavailable`
-- Root cause: TOM v0 has no mechanism to clear `unavailable` state except seeing user input. If user is absent >4h, gate stays closed.
-- Current threshold (2026-05-11): `unavailable` = 0.70 (was 1.10 prior, lowered per discussion). Allows high-importance pings through during long gaps.
-- Implication: Medium-importance messages (0.60-0.75) from curiosity drive still blocked; high-importance (0.70+) now passes.
-- Mitigation: Add time-based decay to `unavailable` state, or route blocked proposals to a digest note instead of requiring Telegram delivery.
 
 ### Pattern B: Rate-Limiter Staircase
 - Symptoms: `propose_goal` logs show `telegram-shape-rate-limit: last telegram-shape goal was X min ago; window is 240 min (Y min remaining)`
@@ -97,18 +78,9 @@ If the system is in a drained state with no active goals, the stuck-cycle breake
 grep "stuck_cycle\|short-term system goal" ~/cognitive-agent/hermes/logs/athena_server.error.log
 ```
 
-### Medium: TOM Threshold Adjustment
-If the TOM gate is systematically blocking all proactive messaging, consider adjusting `ATTENTION_THRESHOLDS` in `tom.py`. Current values (2026-05-11):
-- `available`: 0.40
-- `interruptible`: 0.60
-- `focused`: 0.85
-- `unavailable`: 0.70 (lowered from 1.10 → 0.85 → 0.70)
-
-### Structural: Delivery Path Diversification
-Rather than lowering thresholds, route TOM-blocked proposals into a running digest note (vault or athena_notes) so the daily cron summary can reference them. This preserves the silence gate while preventing hypotheses from being lost.
-
 ## History
 
 - **2026-05-09:** First drained-pipeline detection in daily summary — 0 active goals, `no_top_goal_focus_only` pattern dominating heartbeat ticks.
 - **2026-05-11:** Confirmed pattern persists — 122 completed, 22 abandoned, 0 active. `propose_goal` running (280 iterations) but producing TOM-blocked or rate-limited output.
 - **2026-05-11:** TOM `unavailable` threshold lowered 1.10 → 0.70. `read_vault` tool fixed (scan limit, stopwords, frontmatter excerpts).
+- **2026-05-26:** TOM availability gate removed entirely. Pattern A (TOM gate block) and the medium-mitigation TOM threshold adjustment no longer apply — the gate is gone. Quiet-hours + rate-limit are the only remaining proactive-send gates.

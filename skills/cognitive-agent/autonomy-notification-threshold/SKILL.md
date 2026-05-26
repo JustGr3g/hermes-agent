@@ -128,45 +128,7 @@ print('All smoke tests pass')
 
 ## Upstream Gate: Theory of Mind (ToM v0)
 
-**Important:** NotificationThreshold is NOT the first gate. Since Sprint 2 (May 9, 2026), proactive messages must pass **two** gates:
-
-1. **ToM attention gate** (`tom.py`) — Is Greg available to receive the message?
-2. **NotificationThreshold** — Is the message important enough to break silence?
-
-If ToM gate blocks the message (e.g. state=unavailable, threshold=0.70), it never reaches NotificationThreshold. The gate reports `tom_gate_blocked` telemetry events.
-
-### ToM State → Threshold Mapping
-
-| ToM State | Min Importance Required | Effect |
-|-----------|------------------------|--------|
-| available | 0.40 (low bar) | Almost any ping fires |
-| interruptible | 0.60 | Medium-importance+ |
-| focused | 0.85 | Only high-importance |
-| unavailable | 0.70 (tuned May 11) | High-importance only. Was 1.10 (blocked everything); lowered to 0.85 by Greg then to 0.70 per Athena recommendation — calibrated to catch the 0.60–0.75 range of actual proactive message importance while still filtering sub-0.50 noise. Meant to be dynamic: will tune based on Greg's response to each ping. |
-
-### Diagnostic: Was the gate the blocker?
-
-When a proactive message failed to send, check telemetry:
-
-```bash
-grep "tom_gate_blocked" ~/.hermes/telemetry/events.jsonl | tail -5 | python3 -c "
-import sys, json
-for line in sys.stdin:
-    e = json.loads(line)
-    print(f\"  {e.get('send_reason','?')} → blocked (state={e.get('attention_state','?')}, imp={e.get('importance','?')} < {e.get('gate_reason','?')})\")
-"
-```
-
-If tom_gate_blocked events are present, the issue is NOT the notification threshold — it's the upstream ToM gate. Adjust `ATTENTION_THRESHOLDS` in `tom.py` to change what gets through.
-
-### Self-Consistency Gap (observed May 9, 2026)
-
-The system can create a plan to *calibrate* notification thresholds — and then the ToM gate blocks that plan from executing its first step. This happens when:
-1. `infer_plans` heartbeat creates a plan with importance 0.70
-2. Greg is in `unavailable` state (threshold 1.10)
-3. The plan's `pursue_goal_step` never fires because the ToM gate blocks all tool use
-
-**Resolution:** This isn't a bug — it's correct behavior. The plan sits in the queue and self-starts when Greg returns to `available`. The ToM gate's job is to prevent ANY proactive work that disturbs an unavailable user.
+**Composition:** Proactive messages pass through `_send_proactive_message`, which composes (in order): quiet-hours check → rate limit (`PROACTIVE_HOURLY_CAP`, 6/hour) → NotificationThreshold → `send_message` tool. The previous TOM attention-gate layer was removed 2026-05-26; phone-level DND covers the same role.
 
 ## Common Pitfalls
 

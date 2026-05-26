@@ -107,35 +107,12 @@ def _check_tool_claims(summary: str, truth: dict[str, dict]) -> list[str]:
     return issues
 
 
-# "N blocked", "N blocks", "blocked N times" — for TOM blocks today.
-_BLOCK_RE = re.compile(
-    r"\b(\d+)\s+block(?:s|ed)?\b|\bblocked\s+(\d+)\s+time", re.IGNORECASE
-)
 # "N error(s)", "N timeout(s)", "N 503", etc.
 _HTTP503_RE = re.compile(r"\b(\d+)\s*(?:http[_ -]?)?503", re.IGNORECASE)
 
 
 def _check_block_and_error_claims(summary: str, facts: dict) -> list[str]:
     issues: list[str] = []
-
-    # TOM blocks today — sum of tom_blocks_today and blocked_messages count.
-    tom_blocks = int(facts.get("tom_blocks_today") or 0)
-    blocked_msgs = int(facts.get("blocked_messages_today_count") or 0)
-    # Look for "N blocks/blocked" near "TOM", "auto-trigger", "overnight",
-    # or "today" — same window technique.
-    for kw in ("TOM", "auto-trigger", "overnight", "blocked-message"):
-        for m in re.finditer(re.escape(kw), summary, re.IGNORECASE):
-            start = max(0, m.start() - 60)
-            end = min(len(summary), m.end() + 80)
-            window = summary[start:end]
-            for bm in _BLOCK_RE.finditer(window):
-                claim = int(bm.group(1) or bm.group(2) or 0)
-                if claim and claim not in (tom_blocks, blocked_msgs, tom_blocks + blocked_msgs):
-                    issues.append(
-                        f"- near `{kw}` claimed `{claim} blocked`; "
-                        f"actual today: TOM={tom_blocks}, "
-                        f"blocked_messages={blocked_msgs}"
-                    )
 
     # http_503 / 503 claims.
     err = facts.get("errors_today") or {}
