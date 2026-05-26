@@ -150,11 +150,6 @@ Two gates compose at `_send_proactive_message`:
 1. **Quiet hours** (`ATHENA_QUIET_HOURS`, default 22-7) — hard block during the window.
 2. **Rate limit** (`PROACTIVE_HOURLY_CAP`, default 6/hour) — rolling-window cap.
 
-There is no longer an attention-state / importance-threshold gate. The
-previous TOM availability-gate layer (`tom.py`, `greg_state` table) was
-removed 2026-05-26 — Greg's phone-level DND covers the same role and
-the software gate produced more misnarration than value.
-
 ### Multi-Drive System
 
 Four competing drives in `drives.py`:

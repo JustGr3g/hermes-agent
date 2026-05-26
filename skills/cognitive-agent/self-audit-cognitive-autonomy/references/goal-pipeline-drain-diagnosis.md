@@ -81,6 +81,5 @@ grep "stuck_cycle\|short-term system goal" ~/cognitive-agent/hermes/logs/athena_
 ## History
 
 - **2026-05-09:** First drained-pipeline detection in daily summary — 0 active goals, `no_top_goal_focus_only` pattern dominating heartbeat ticks.
-- **2026-05-11:** Confirmed pattern persists — 122 completed, 22 abandoned, 0 active. `propose_goal` running (280 iterations) but producing TOM-blocked or rate-limited output.
-- **2026-05-11:** TOM `unavailable` threshold lowered 1.10 → 0.70. `read_vault` tool fixed (scan limit, stopwords, frontmatter excerpts).
-- **2026-05-26:** TOM availability gate removed entirely. Pattern A (TOM gate block) and the medium-mitigation TOM threshold adjustment no longer apply — the gate is gone. Quiet-hours + rate-limit are the only remaining proactive-send gates.
+- **2026-05-11:** Confirmed pattern persists — 122 completed, 22 abandoned, 0 active. `propose_goal` running (280 iterations) but producing rate-limited output.
+- **2026-05-11:** `read_vault` tool fixed (scan limit, stopwords, frontmatter excerpts).

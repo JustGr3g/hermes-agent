@@ -128,7 +128,7 @@ print('All smoke tests pass')
 
 ## Upstream Gate: Theory of Mind (ToM v0)
 
-**Composition:** Proactive messages pass through `_send_proactive_message`, which composes (in order): quiet-hours check → rate limit (`PROACTIVE_HOURLY_CAP`, 6/hour) → NotificationThreshold → `send_message` tool. The previous TOM attention-gate layer was removed 2026-05-26; phone-level DND covers the same role.
+**Composition:** Proactive messages pass through `_send_proactive_message`, which composes (in order): quiet-hours check → rate limit (`PROACTIVE_HOURLY_CAP`, 6/hour) → NotificationThreshold → `send_message` tool.
 
 ## Common Pitfalls
 
