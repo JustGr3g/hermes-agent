@@ -32,7 +32,6 @@ ERROR_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "athena_server.error.
 GATEWAY_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "gateway.log"
 CRON_JOBS = HOME / "cognitive-agent" / "hermes" / "cron" / "jobs.json"
 NOTES_DIR = HOME / "cognitive-agent" / "notes"
-BLOCKED_LOG = HOME / "cognitive-agent" / "data" / "blocked_messages.jsonl"
 # Sidecar JSON that verify_summary_numbers.py reads to fact-check the LLM
 # output. Lives next to the script so both halves of the pipeline find it
 # at a stable path without depending on env vars.
@@ -234,28 +233,6 @@ def gather() -> dict:
         try: conn.close()
         except Exception: pass
 
-    # ── TOM blocks today (real count from log) ─────────────────────────
-    out["tom_blocks_today"] = _count_loglines(
-        ERROR_LOG, today_str, "Proactive message blocked by TOM"
-    )
-
-    # ── TOM operating mode (env var; default enforcing) ────────────────
-    # Read from the LaunchAgent plist so we surface the mode the live
-    # server is running in, not whatever env this cron job inherited.
-    out["tom_mode"] = "enforcing"
-    try:
-        import plistlib
-        _plist = Path.home() / "Library" / "LaunchAgents" / "ai.athena.server.plist"
-        if _plist.exists():
-            with open(_plist, "rb") as _pf:
-                _data = plistlib.load(_pf)
-            _env = _data.get("EnvironmentVariables", {}) or {}
-            _mode = (_env.get("ATHENA_TOM_MODE") or "").strip().lower()
-            if _mode:
-                out["tom_mode"] = _mode
-    except Exception as e:
-        out["tom_mode_error"] = str(e)
-
     # ── Errors / warnings in log today ─────────────────────────────────
     err_patterns: Counter[str] = Counter()
     error_examples: list[str] = []
@@ -295,51 +272,7 @@ def gather() -> dict:
     except Exception as e:
         out["notes_error"] = str(e)
 
-    # ── Blocked-message digest (if exists) ─────────────────────────────
-    # IMPORTANT: these are PROACTIVE OUTBOUND MESSAGES Athena tried to send
-    # Greg that the TOM availability/importance gate suppressed. They are
-    # NOT goal pursuit refusals. The underlying goal in many cases ran
-    # successfully — only the "I'm starting work on X" notification got
-    # suppressed because Greg was asleep / unavailable / the message
-    # importance fell below the current threshold. Mislabelling these as
-    # "blocked auto-triggers" (a goal-pursuit framing) is the recurring
-    # confab pattern from the 2026-05-17 summary. Surface them as what
-    # they are: notification-channel suppressions, working-as-designed.
-    try:
-        if BLOCKED_LOG.exists():
-            with open(BLOCKED_LOG) as f:
-                lines = [json.loads(l) for l in f.readlines() if l.strip()]
-            today_start, _now = _today_bounds()
-            today_blocked = [
-                l for l in lines
-                if l.get("ts", 0) >= today_start
-            ]
-            out["proactive_messages_suppressed_today_count"] = len(today_blocked)
-            # Sample first 5
-            out["proactive_messages_suppressed_today_sample"] = [
-                {
-                    "ts": datetime.datetime.fromtimestamp(l["ts"]).strftime("%H:%M:%S"),
-                    "reason": l.get("reason", "?"),
-                    "importance": l.get("importance"),
-                    "preview": (l.get("message") or "")[:100],
-                }
-                for l in today_blocked[:5]
-            ]
-            # Back-compat alias — older summaries and external code may
-            # still read the old key; keep it pointing at the same data.
-            out["blocked_messages_today_count"] = len(today_blocked)
-            out["blocked_messages_today_sample"] = out[
-                "proactive_messages_suppressed_today_sample"
-            ]
-        else:
-            out["proactive_messages_suppressed_today_count"] = 0
-            out["proactive_messages_suppressed_today_sample"] = []
-            out["blocked_messages_today_count"] = 0
-            out["blocked_messages_today_sample"] = []
-    except Exception as e:
-        out["blocked_messages_error"] = str(e)
-
-    # ── Goal pursuit refusals (cycle-level, separate from message blocks) ──
+    # ── Goal pursuit refusals (cycle-level) ────────────────────────────
     # A goal pursuit refusal is when the cognitive cycle DECLINED to run a
     # goal — distinct from suppressing the announcement that the goal is
     # running. Sources: metacognitive_events with type containing
@@ -463,45 +396,6 @@ def render_markdown(facts: dict) -> str:
         for e in edits:
             status = "ok" if e["success"] else "FAIL"
             lines.append(f"- {e['at']} [{status}] {e['args']}")
-        lines.append("")
-
-    _tom_mode = facts.get("tom_mode", "enforcing")
-    lines.append(f"## TOM gate mode: **{_tom_mode}**\n")
-    if _tom_mode == "log_only":
-        lines.append(
-            "TOM is in LOG-ONLY mode. The gate evaluates but never blocks; "
-            "every decision is recorded to blocked_messages.jsonl with a "
-            "`would_have_blocked` flag for weekly review. **Do not propose "
-            "TOM-threshold-diagnosis goals while this mode is active** — "
-            "zero real blocks is expected and intentional."
-        )
-        lines.append("")
-    lines.append(f"## Proactive messages blocked by TOM today: {facts.get('tom_blocks_today', 0)}\n")
-    _suppressed = facts.get(
-        "proactive_messages_suppressed_today_count",
-        facts.get("blocked_messages_today_count", 0),
-    )
-    if _suppressed > 0:
-        lines.append(
-            f"## Proactive notifications suppressed by TOM availability gate "
-            f"today: {_suppressed}\n"
-        )
-        lines.append(
-            "**These are NOTIFICATION-channel suppressions, not goal-pursuit "
-            "refusals.** When the TOM availability gate decides Greg is asleep "
-            "/ unavailable / not receptive, it suppresses the 'I'm starting "
-            "work on X' announcement. The underlying goal in most cases still "
-            "ran — only the proactive message about it got filtered. Do NOT "
-            "frame these as 'blocked auto-triggers' or 'goal pipeline issues' "
-            "in §4 — they are working-as-designed channel suppressions. Goal "
-            "pursuit refusals appear separately below."
-        )
-        lines.append("")
-        for b in facts.get("proactive_messages_suppressed_today_sample", []):
-            lines.append(
-                f"- {b['ts']} — reason={b['reason']} — imp={b['importance']} — "
-                f"preview={b['preview']!r}"
-            )
         lines.append("")
 
     _refusals_total = facts.get("goal_pursuit_refusals_today_total", 0)
