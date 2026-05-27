@@ -183,6 +183,12 @@ def gather() -> dict:
         except Exception: pass
 
     # ── Tool fire stats (today) ────────────────────────────────────────
+    # `synth:*` rows are excluded: they are post-hoc telemetry markers
+    # written by `cognitive_cycle._record_synth_outcome` with success=False
+    # hardcoded — not real tool executions. Including them tricked the
+    # narrative LLM into reading them as "100% failing tools" (see
+    # notes/routine-2026-05-22.md / 2026-05-23.md / 2026-05-27.md).
+    # They surface separately under synth_markers_today below.
     try:
         conn = sqlite3.connect(DB)
         today_start, _now = _today_bounds()
@@ -192,14 +198,75 @@ def gather() -> dict:
             "  SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS fail, "
             "  ROUND(AVG(latency_ms), 1) AS avg_ms "
             "FROM tool_outcomes WHERE timestamp >= ? "
+            "  AND tool_name NOT LIKE 'synth:%' "
             "GROUP BY tool_name ORDER BY (ok+fail) DESC",
             (today_start,),
         ).fetchall()
         out["tool_fires_today"] = [
             {"tool": r[0], "ok": r[1], "fail": r[2], "avg_ms": r[3]} for r in rows
         ]
+        # Separate synth-marker rollup so the cycle's no_tool_resolution
+        # behavior remains visible — but framed correctly as "abstract
+        # output goals the LLM couldn't decompose," not as tool failures.
+        rows = conn.execute(
+            "SELECT tool_name, COUNT(*) AS n, "
+            "  ROUND(AVG(latency_ms), 1) AS avg_ms "
+            "FROM tool_outcomes WHERE timestamp >= ? "
+            "  AND tool_name LIKE 'synth:%' "
+            "GROUP BY tool_name ORDER BY n DESC",
+            (today_start,),
+        ).fetchall()
+        out["synth_markers_today"] = [
+            {"marker": r[0], "count": r[1], "avg_decide_latency_ms": r[2]}
+            for r in rows
+        ]
     except Exception as e:
         out["tool_fires_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    # ── Musing activity (today) ────────────────────────────────────────
+    # Musing fires from `cognitive_cycle._break_stuck_cycle` Scenario 2
+    # when `athena_musing_enabled` is on and a focus has accumulated. Each
+    # fire emits a `stuck_cycle_musing` metacog event with the focus +
+    # thought_preview + has_followup flag in the `data` field. Reading
+    # these directly prevents the morning summary from claiming "Musing
+    # hasn't fired" when it has (see notes/routine-2026-05-27.md §4.3).
+    try:
+        conn = sqlite3.connect(DB)
+        today_start, _now = _today_bounds()
+        rows = conn.execute(
+            "SELECT timestamp, context, COALESCE(data, '{}') "
+            "FROM metacognitive_events "
+            "WHERE timestamp >= ? "
+            "  AND context IN ('stuck_cycle_musing', 'stuck_cycle_force_propose') "
+            "ORDER BY timestamp DESC",
+            (today_start,),
+        ).fetchall()
+        musing_fires = []
+        force_propose_fires = 0
+        for ts, ctx, data_raw in rows:
+            if ctx == "stuck_cycle_force_propose":
+                force_propose_fires += 1
+                continue
+            try:
+                d = json.loads(data_raw) if data_raw else {}
+            except Exception:
+                d = {}
+            musing_fires.append({
+                "at": datetime.datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M:%S"),
+                "focus": str(d.get("focus", ""))[:60],
+                "has_followup": bool(d.get("has_followup", False)),
+                "thought_preview": str(d.get("thought_preview", ""))[:140],
+            })
+        out["musing_fires_today"] = musing_fires
+        out["musing_followup_count_today"] = sum(
+            1 for m in musing_fires if m["has_followup"]
+        )
+        out["force_propose_fallback_today"] = force_propose_fires
+    except Exception as e:
+        out["musing_error"] = str(e)
     finally:
         try: conn.close()
         except Exception: pass
@@ -382,6 +449,73 @@ def render_markdown(facts: dict) -> str:
     for t in facts.get("tool_fires_today", []):
         lines.append(
             f"- {t['tool']}: ok={t['ok']} fail={t['fail']} avg_ms={t['avg_ms']}"
+        )
+    lines.append("")
+    lines.append(
+        "_`synth:*` rows are NOT in the list above. They are post-hoc "
+        "telemetry markers (always `success=0` by construction) — not "
+        "tool executions. Do NOT describe them as 'failing tools' in the "
+        "summary. See the next section if you want to talk about them._"
+    )
+    lines.append("")
+
+    synth = facts.get("synth_markers_today", []) or []
+    lines.append(
+        f"## Synth markers today (no_tool_resolution etc.): "
+        f"{sum(m['count'] for m in synth)}\n"
+    )
+    if synth:
+        lines.append(
+            "These are NOT tool failures. Each row is the cognitive cycle "
+            "recording that an abstract goal's LLM-decide phase returned "
+            "no resolvable tool. The latency is the LLM call cost, not "
+            "wasted work by a 'synth tool'. Frame this as 'goals the LLM "
+            "couldn't decompose into a single tool call,' if at all."
+        )
+        lines.append("")
+        for m in synth:
+            lines.append(
+                f"- {m['marker']}: count={m['count']} "
+                f"avg_decide_latency_ms={m['avg_decide_latency_ms']}"
+            )
+    else:
+        lines.append("- (zero synth markers today)")
+    lines.append("")
+
+    musing_fires = facts.get("musing_fires_today", []) or []
+    followup_n = facts.get("musing_followup_count_today", 0)
+    force_n = facts.get("force_propose_fallback_today", 0)
+    lines.append(
+        f"## Musing activity today (Crystalline Quilt P1): "
+        f"{len(musing_fires)} fires, {followup_n} with follow-up action\n"
+    )
+    if musing_fires:
+        lines.append(
+            "Each row is a `stuck_cycle_musing` metacog event — Musing "
+            "fired, the LLM crystallized a thought, and decided whether "
+            "to propose a follow-up action. `has_followup=False` is a "
+            "first-class outcome (sitting with the thought is fine)."
+        )
+        lines.append("")
+        for m in musing_fires[:8]:
+            tag = "→action" if m["has_followup"] else "→sit"
+            lines.append(
+                f"- {m['at']} [{tag}] focus={m['focus']!r} "
+                f"thought={m['thought_preview']!r}"
+            )
+        if len(musing_fires) > 8:
+            lines.append(f"- … and {len(musing_fires) - 8} more")
+    else:
+        lines.append(
+            "- (Musing did not fire today — either the runtime flag "
+            "`athena_musing_enabled` is off, no focus accumulated, or no "
+            "`no_top_goal` stuck-cycle was hit)"
+        )
+    if force_n > 0:
+        lines.append("")
+        lines.append(
+            f"_Legacy `stuck_cycle_force_propose` fallback fired {force_n}× "
+            "today (Musing path was off or failed → old force-propose ran)._"
         )
     lines.append("")
 
