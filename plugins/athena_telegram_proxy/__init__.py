@@ -176,6 +176,135 @@ def _handle_dismiss_goal(raw_args: str) -> Optional[str]:
         return f"(/dismiss-goal error: {e})"
 
 
+def _handle_gh_action(action: str, raw_args: str) -> Optional[str]:
+    """Shared implementation for /gh-approve and /gh-reject.
+
+    Wired into the "📝 Draft (Athena)" Telegram preview that fires when
+    github_propose_comment or github_propose_issue queue a draft. Defaults
+    to the latest pending draft when no slug is provided — same pattern as
+    /approve / /retry / /abandon for needs_review goals.
+
+    Posts go through to athena_server.py's /github-writes endpoints; the
+    actual `gh` invocation happens there (gh CLI is auth'd as JustGr3g
+    via the system keyring, which the launchd-launched server can reach).
+    """
+    slug_hint = (raw_args or "").strip()
+    try:
+        if slug_hint:
+            url = f"{ATHENA_URL}/github-writes/{slug_hint}/{action}"
+        else:
+            url = f"{ATHENA_URL}/github-writes/latest/{action}"
+        # gh writes can take a few seconds; 30s timeout is generous but
+        # bounded so a hung gh process doesn't hold the Telegram bot.
+        resp = requests.post(url, timeout=30)
+        if resp.status_code != 200:
+            return f"(/gh-{action} error {resp.status_code}: {resp.text[:200]})"
+        data = resp.json()
+        if not data.get("ok"):
+            return f"(/gh-{action}: {data.get('reason') or data.get('error') or 'failed'})"
+        slug_short = (data.get("draft_id") or "?")[:8]
+        if action == "approve":
+            url_posted = data.get("posted_url") or ""
+            tail = f"\nPosted: {url_posted}" if url_posted else ""
+            return f"✅ `{slug_short}` posted to GitHub.{tail}"
+        return f"🗑 `{slug_short}` rejected (no GitHub side-effect)."
+    except requests.exceptions.ConnectionError:
+        return "(Athena server is not reachable on :8765)"
+    except Exception as e:
+        return f"(/gh-{action} proxy error: {e})"
+
+
+def _handle_gh_approve(raw_args: str) -> Optional[str]:
+    return _handle_gh_action("approve", raw_args)
+
+
+def _handle_gh_reject(raw_args: str) -> Optional[str]:
+    return _handle_gh_action("reject", raw_args)
+
+
+def _handle_gh_pending(raw_args: str) -> Optional[str]:
+    """List pending GitHub drafts — useful when multiple are queued and
+    Greg wants to inspect before /gh-approve'ing a specific one."""
+    try:
+        resp = requests.get(f"{ATHENA_URL}/github-writes/pending", timeout=10)
+        if resp.status_code != 200:
+            return f"(/gh-pending error {resp.status_code})"
+        data = resp.json()
+        drafts = data.get("drafts", [])
+        if not drafts:
+            return "_No pending GitHub drafts._"
+        lines = [f"📝 *Pending GitHub drafts ({data.get('count', 0)}):*"]
+        for d in drafts[:10]:
+            slug = d["id"][:8]
+            kind = d.get("action_type", "?")
+            tgt_kind = d.get("target_kind") or "?"
+            tgt_num = d.get("target_number")
+            target = (
+                f"new issue: \"{(d.get('title') or '')[:50]}\""
+                if kind == "issue" or tgt_kind == "new"
+                else f"{tgt_kind}#{tgt_num}"
+            )
+            body_preview = (d.get("body") or "").replace("\n", " ")[:80]
+            lines.append(f"  `{slug}` — {kind} on {target}\n    > {body_preview}")
+        if len(drafts) > 10:
+            lines.append(f"\n_(showing 10 of {len(drafts)})_")
+        return "\n".join(lines)
+    except requests.exceptions.ConnectionError:
+        return "(Athena server is not reachable on :8765)"
+    except Exception as e:
+        return f"(/gh-pending proxy error: {e})"
+
+
+def _handle_needs_review_action(action: str, raw_args: str) -> Optional[str]:
+    """Shared implementation for /approve, /retry, /abandon — triages the
+    most-recent NEEDS_REVIEW goal (or a specified ID prefix).
+
+    Wired into the "🤔 Needs review — … /approve, /retry, or /abandon"
+    notification template. Before 2026-05-25 these commands didn't exist
+    and the Telegram bot replied "Unknown command" — see the screenshot
+    in the conversation that triggered this fix.
+    """
+    goal_id_hint = (raw_args or "").strip()
+    body: dict = {}
+    if goal_id_hint:
+        body["goal_id"] = goal_id_hint
+    try:
+        resp = requests.post(
+            f"{ATHENA_URL}/goals/needs-review/{action}",
+            json=body,
+            timeout=15,
+        )
+        if resp.status_code != 200:
+            return f"(/{action} error {resp.status_code}: {resp.text[:200]})"
+        data = resp.json()
+        if not data.get("ok"):
+            return f"(/{action}: {data.get('reason') or 'failed'})"
+        gid = (data.get("goal_id") or "?")[:8]
+        new_status = data.get("new_status", "?")
+        verb = {
+            "approve": "approved (verifier override → completed)",
+            "retry": "retrying (back to active)",
+            "abandon": "abandoned",
+        }[action]
+        return f"✅ `{gid}` {verb}. New status: `{new_status}`."
+    except requests.exceptions.ConnectionError:
+        return "(Athena server is not reachable on :8765)"
+    except Exception as e:
+        return f"(/{action} proxy error: {e})"
+
+
+def _handle_approve(raw_args: str) -> Optional[str]:
+    return _handle_needs_review_action("approve", raw_args)
+
+
+def _handle_retry(raw_args: str) -> Optional[str]:
+    return _handle_needs_review_action("retry", raw_args)
+
+
+def _handle_abandon(raw_args: str) -> Optional[str]:
+    return _handle_needs_review_action("abandon", raw_args)
+
+
 def _handle_audit(raw_args: str) -> Optional[str]:
     """Show a chronological view of Athena's autonomous behavior.
 
@@ -553,4 +682,77 @@ def register(ctx):
         description="Show a chronological view of Athena's autonomous behavior. "
                     "Default 6 hours; pass a number for custom window (e.g. /audit 24).",
         args_hint="[hours]",
+    )
+    # 2026-05-25: needs_review triage. The "🤔 Needs review" notification
+    # template tells Greg how to act on a goal that landed in needs_review
+    # (verifier rejected the completion claim, or cycle gave up).
+    #
+    # 2026-05-25 (later): renamed from /approve, /retry, /abandon to
+    # /approve-review, /retry-review, /abandon-review. The bare /approve
+    # and /retry conflicted with Hermes built-ins (Hermes
+    # /approve = approve dangerous command, /retry = resend last message)
+    # and were silently rejected — observed in agent.log:
+    #   "Plugin tried to register command '/approve' which conflicts with
+    #    a built-in command. Skipping."
+    # So the notification's call-to-action was vapor on two of three
+    # commands. /abandon happened to register fine; the rename
+    # /abandon → /abandon-review is for symmetry. An /abandon alias is
+    # kept for back-compat since Greg has muscle memory for it.
+    ctx.register_command(
+        "approve-review",
+        handler=_handle_approve,
+        description="Override the verifier on a needs_review goal — mark it COMPLETED. "
+                    "Defaults to the most-recent needs_review goal; pass an id prefix "
+                    "to target a specific one.",
+        args_hint="[goal-id-prefix]",
+    )
+    ctx.register_command(
+        "retry-review",
+        handler=_handle_retry,
+        description="Move a needs_review goal back to ACTIVE so the cycle re-attempts. "
+                    "failure_count resets; attempt_count is preserved to keep the "
+                    "MAX_GOAL_ATTEMPTS ceiling honest.",
+        args_hint="[goal-id-prefix]",
+    )
+    ctx.register_command(
+        "abandon-review",
+        handler=_handle_abandon,
+        description="Abandon a needs_review goal. Fires the goal_abandoned hook "
+                    "(closes the loop with a ⚠️ Telegram). Defaults to the most-recent "
+                    "needs_review goal.",
+        args_hint="[goal-id-prefix]",
+    )
+    # Back-compat: /abandon already worked (not a Hermes built-in) and
+    # Greg has used it. Keep it as an alias.
+    ctx.register_command(
+        "abandon",
+        handler=_handle_abandon,
+        description="Alias for /abandon-review — abandon a needs_review goal.",
+        args_hint="[goal-id-prefix]",
+    )
+    # 2026-05-25: GitHub write-with-approval. Athena's github_propose_*
+    # tools queue drafts; these commands approve/reject without leaving
+    # Telegram. /gh-pending lists what's queued.
+    ctx.register_command(
+        "gh-approve",
+        handler=_handle_gh_approve,
+        description="Approve a pending GitHub draft and post it (comment or issue). "
+                    "Defaults to the most-recent draft; pass a slug prefix for a "
+                    "specific one. Drafts come from Athena's github_propose_* tools "
+                    "and were previewed by Telegram before this action.",
+        args_hint="[draft-slug-prefix]",
+    )
+    ctx.register_command(
+        "gh-reject",
+        handler=_handle_gh_reject,
+        description="Reject a pending GitHub draft (no posting to GitHub). "
+                    "Defaults to the most-recent draft; pass a slug prefix for a "
+                    "specific one.",
+        args_hint="[draft-slug-prefix]",
+    )
+    ctx.register_command(
+        "gh-pending",
+        handler=_handle_gh_pending,
+        description="List Athena's pending GitHub drafts (each has a slug usable "
+                    "with /gh-approve or /gh-reject).",
     )

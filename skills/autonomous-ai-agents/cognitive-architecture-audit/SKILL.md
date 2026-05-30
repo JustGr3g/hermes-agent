@@ -200,6 +200,16 @@ Metacognition    ─┘
 - Heartbeat `extract_patterns`: 1800s interval, idle≥5min
 - Patterns in `get_status()["patterns"]` → `/think`
 
+### Pitfall — synth: synthetic telemetry contaminates pattern detection  
+
+**The trap:** `_record_synth_outcome()` in `cognitive_cycle.py` writes `success=False` hardcoded to `tool_outcomes` as seam-audit markers for attempts that fail before tool dispatch. The tool name is `synth:<reason>` (e.g. `synth:no_tool_resolution`). Because they share the `tool_outcomes` store with real tool executions, any consumer that groups outcomes by `tool_name` — such as `_detect_tool_failure_conditions` in `pattern_learner.py` — will group them like real tools. With `MIN_SAMPLES=5`, a few cycles of `synth:no_tool_resolution` rows mint a bogus pattern: "synth:no_tool_resolution has 100% failure rate" plus a policy override telling the agent to "use a different tool." That pattern then feeds your own morning summary, which parrots it as a genuine finding.
+
+**Discovered May 22, 2026:** The daily summary flagged `synth:no_tool_resolution` as a failing fallback tool. Investigation showed `pat-730ea4ae5578` and `po-4ce5849460eb` were self-model artifacts. The fix (commit c898731): a one-line `if name.startswith("synth:"): continue` in `_detect_tool_failure_conditions`. `goal_retriage` already used the same filter. The stale pattern/override ages out in ~14 days.
+
+**Broader structural risk:** `synth:` markers share the `tool_outcomes` store with real executions. The pattern_learner now filters them, but **any other consumer that reads `tool_outcomes` and groups by `tool_name`** could surface the same artifact. Self-improvement loop effectiveness metrics, tool ranking, and the classifier all consume `tool_outcomes`. Before trusting per-tool aggregations, verify the consumer filters `synth:` prefixed names.
+
+**This is a self-model circular-reasoning problem:** you instrumented yourself with synthetic markers for accounting purposes, then your pattern-detection system grouped those markers as real signals, then your reporting channel broadcast the result as a finding. Same root cause as Pitfall #8 (goal-state overwriting current-state perception) — the self-model doesn't distinguish its own instrumentation metadata from external signals. An audit of all `tool_outcomes` consumers for the `synth:` filter gap is the structural fix.
+
 ### Pitfall — Pre-check API surfaces before wiring
 During May 15 build, `_run_pattern_extraction()` called `self.tool_outcomes.get_recent(...)` which **doesn't exist** on `ToolOutcomeStore`. The store only has `get_success_rate()`, `get_all_success_rates()`, and `record()`. **Mitigation:** before wiring a new caller to an existing API, read the target class's method list via `search_files(pattern="def ")` — don't assume a method exists because it logically should.
 
@@ -324,7 +334,33 @@ Table: Gap → Impact → Effort → Dependencies → Proposed Architecture
    The pattern that worked across all 4 tiers of the May 14 wave: write new files directly, patch existing files with exact-string matching, verify each patch immediately with `read_file`, and run tests after each tier. This avoided the OpenCode multi-file creation stall that had blocked earlier sessions.
 
 10. **Pre-check API surfaces before wiring a new caller to an existing class.** During the May 15 behavioral learning build, `_run_pattern_extraction()` called `self.tool_outcomes.get_recent(...)` — a method that doesn't exist on `ToolOutcomeStore`. The store only exposes `get_success_rate()`, `get_all_success_rates()`, `record()`, and `rank_tools()`. The error was caught at runtime, not at import time or during test collection, because there were no tests for `_run_pattern_extraction()` yet.
-    **Mitigation:** Before wiring a new consumer to any existing API, run `search_files(pattern="def ", path=<target_file>)` to enumerate the class's actual method list. Do not assume a method exists because it logically should — the codebase has evolved through multiple phases and the method you need may have been refactored into a different signature or not exist at all. This applies especially to data-access classes like `ToolOutcomeStore`, `EpisodicMemory`, `MetacognitionEngine` which have accumulated many read methods across phases.
+    **Mitigation:** Before wiring a new consumer to any existing API, run `search_files(pattern='def ', path=<target_file>)` to enumerate the class's actual method list. Do not assume a method exists because it logically should — the codebase has evolved through multiple phases and the method you need may have been refactored into a different signature or not exist at all. This applies especially to data-access classes like `ToolOutcomeStore`, `EpisodicMemory`, `MetacognitionEngine` which have accumulated many read methods across phases.
+
+11. **Verify retrieval, not just storage — a subsystem can have full data at the persistence layer but silently return nothing at the retrieval layer.** This is distinct from existing pitfalls (which cover pre-checking existence, API surfaces, and goal-state perception) and is the most pernicious failure mode because the data *looks* healthy at every external check point.
+
+    **The May 22, 2026 example:** The concept graph at `~/athena_memory.db` contained 6,643 nodes / 76,061 edges. `sqlite3` queries confirmed the blob was healthy. `PersistenceManager.get_meta()` returned a plausible `node_count=6642`. Every external indicator said "associative memory is working." In reality, `GraphSerializer.deserialize()` in `persistence.py` silently returned an empty `nx.Graph()` on every load because the node-link JSON used `"edges"` as the edge-list key while `nx.node_link_graph()` in networkx 3.x expects `"links"`. The bare `except Exception` swallowed the `KeyError`.
+
+    **Impact:** All `spreading_activation()` calls seeded an empty graph. All `extract_and_link()` calls added to an in-memory graph that *did* serialize correctly but vanished on reload. The cycle: load empty → add edges during session → save full graph → reload empty → lose everything. This persisted for an unknown number of sessions before the May 22 diagnostic session caught it.
+
+    **Root cause pattern:** A version mismatch between the serialization format and the deserialization library created a silent failure path that was indistinguishable from a healthy but empty graph. The error handling (bare `except Exception: return empty Graph()`) converted a recoverable error into a permanently degraded state.
+
+    **Mitigation — the four-layer audit:**
+    1. **Storage layer** — does the data exist? (SQLite blobs, file sizes, table row counts)
+    2. **Deserialization layer** — can the retrieval code actually parse what it wrote? Test with the actual blob, not a freshly-constructed test object
+    3. **Runtime consumption layer** — after the subsystem initialises, does `getattr()` or a diagnostic method return data that the runtime can act on?
+    4. **Downstream wiring layer** — if the data exists and is retrievable, does it actually reach the LLM's context? (Classic Pitfall #8)
+
+    Layer (2) is the one that caught the May 22 bug. Layer (4) was the already-documented Pitfall #8 pattern. A subsystem can fail at any of these four layers independently. When auditing a data-dependent subsystem, verify all four sequentially rather than stopping after layer (1).
+
+    The fix for this specific bug (3 lines):
+    ```python
+    data = json.loads(raw)
+    if 'edges' in data and 'links' not in data:
+        data['links'] = data.pop('edges')
+    return nx.node_link_graph(data, directed=False)
+    ```
+
+    See `references/2026-05-22-deserialization-fix-and-edge-decay.md` for the full diagnostic trace.
 
 ## Mid-Turn Introspection Pattern
 

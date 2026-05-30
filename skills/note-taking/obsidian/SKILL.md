@@ -19,6 +19,10 @@ walking the entire home dir times out (3+ minutes observed):
 find ~/Documents -maxdepth 3 -name ".obsidian" -type d 2>/dev/null
 ```
 
+## Related Skills
+
+- **`store-shared-documents`** — Automatically converts docs (PDFs, etc.) shared via Telegram into markdown + original, stored under `00-Inbox/Shared Documents/YYYY-MM-DD - Title/`. That folder is a good starting point for vault-wide searches — it's where inbound document content lands.
+
 ## Search rules (avoid the slow paths)
 
 1. **Always anchor at `$VAULT`** — never `find ~/`, never `find /`.

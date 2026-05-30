@@ -3,25 +3,20 @@ model:
   provider: ollama-cloud
   base_url: https://ollama.com/v1
 providers: {}
-# Fallback chain (2026-05-21). Tried in order when the primary fails or — once
-# the latency backstop ships — when first-token latency repeatedly exceeds the
-# deadline (FailoverReason.slow_provider). Ranked by the Athena turn-replay A/B:
-# both are fast, clean, ~80% tool-call reliability. Keep deepseek-v4-flash as
-# the primary default — it led the A/B at 92%.
 fallback_providers:
-  - provider: ollama-cloud
-    model: minimax-m2.7:cloud
-    base_url: https://ollama.com/v1
-    key_env: OLLAMA_API_KEY
-  - provider: ollama-cloud
-    model: nemotron-3-super:cloud
-    base_url: https://ollama.com/v1
-    key_env: OLLAMA_API_KEY
+- provider: ollama-cloud
+  model: minimax-m2.7:cloud
+  base_url: https://ollama.com/v1
+  key_env: OLLAMA_API_KEY
+- provider: ollama-cloud
+  model: nemotron-3-super:cloud
+  base_url: https://ollama.com/v1
+  key_env: OLLAMA_API_KEY
 credential_pool_strategies: {}
 toolsets:
 - hermes-cli
 agent:
-  max_turns: 30
+  max_turns: 90
   gateway_timeout: 1800
   restart_drain_timeout: 60
   api_max_retries: 3
@@ -322,85 +317,78 @@ goals:
   max_turns: 20
 skills:
   external_dirs: []
-  # Catalog pruned 2026-05-21. The auto-generated <available_skills> block was
-  # ~120 skills / ~10k chars (53% of the system prompt); an audit of 267 real
-  # turns found 80% of code-modification turns loaded no skill — the maximalist
-  # "scan everything" catalog was self-defeating. Pruned to 29 Athena-relevant
-  # skills (cognitive, software-development, github, obsidian, google-workspace,
-  # opencode, hermes-agent, self-reporting). Disabled skills are hidden from the
-  # catalog AND not loadable via skill_view — re-enable by deleting the name.
-  disabled:
-    - "Skill Factory"
-    - airtable
-    - apple-notes
-    - apple-reminders
-    - architecture-diagram
-    - arxiv
-    - ascii-art
-    - ascii-video
-    - audiocraft-audio-generation
-    - baoyu-comic
-    - baoyu-infographic
-    - blogwatcher
-    - claude-code
-    - claude-design
-    - codex
-    - comfyui
-    - design-md
-    - dogfood
-    - dspy
-    - evaluating-llms-harness
-    - excalidraw
-    - findmy
-    - gif-search
-    - godmode
-    - heartmula
-    - himalaya
-    - huggingface-hub
-    - humanizer
-    - ideation
-    - imessage
-    - jupyter-live-kernel
-    - kanban-orchestrator
-    - kanban-worker
-    - linear
-    - llama-cpp
-    - llm-wiki
-    - macos-computer-use
-    - manim-video
-    - maps
-    - minecraft-modpack-server
-    - nano-pdf
-    - native-mcp
-    - notion
-    - obliteratus
-    - ocr-and-documents
-    - openhue
-    - p5js
-    - pixel-art
-    - pokemon-player
-    - polymarket
-    - popular-web-designs
-    - powerpoint
-    - pretext
-    - research-paper-writing
-    - segment-anything-model
-    - serving-llms-vllm
-    - sketch
-    - songsee
-    - songwriting-and-ai-music
-    - spotify
-    - teams-meeting-pipeline
-    - touchdesigner-mcp
-    - webhook-subscriptions
-    - weights-and-biases
-    - xurl
-    - youtube-content
-    - yuanbao
   template_vars: true
   inline_shell: false
   inline_shell_timeout: 10
   guard_agent_created: false
+  disabled:
+  - Skill Factory
+  - airtable
+  - apple-notes
+  - apple-reminders
+  - architecture-diagram
+  - arxiv
+  - ascii-art
+  - ascii-video
+  - audiocraft-audio-generation
+  - baoyu-comic
+  - baoyu-infographic
+  - blogwatcher
+  - claude-code
+  - claude-design
+  - codex
+  - comfyui
+  - design-md
+  - dogfood
+  - dspy
+  - evaluating-llms-harness
+  - excalidraw
+  - findmy
+  - gif-search
+  - godmode
+  - heartmula
+  - himalaya
+  - huggingface-hub
+  - humanizer
+  - ideation
+  - imessage
+  - jupyter-live-kernel
+  - kanban-orchestrator
+  - kanban-worker
+  - linear
+  - llama-cpp
+  - llm-wiki
+  - macos-computer-use
+  - manim-video
+  - maps
+  - minecraft-modpack-server
+  - nano-pdf
+  - native-mcp
+  - notion
+  - obliteratus
+  - ocr-and-documents
+  - openhue
+  - p5js
+  - pixel-art
+  - pokemon-player
+  - polymarket
+  - popular-web-designs
+  - powerpoint
+  - pretext
+  - research-paper-writing
+  - segment-anything-model
+  - serving-llms-vllm
+  - sketch
+  - songsee
+  - songwriting-and-ai-music
+  - spotify
+  - teams-meeting-pipeline
+  - touchdesigner-mcp
+  - webhook-subscriptions
+  - weights-and-biases
+  - xurl
+  - youtube-content
+  - yuanbao
   creation_nudge_interval: 15
 curator:
   enabled: true
@@ -448,10 +436,11 @@ approvals:
   mcp_reload_confirm: true
   destructive_slash_confirm: true
 command_allowlist:
-- shell command via -c/-lc flag
 - kill process via pgrep expansion (self-termination)
-- delete in root path
+- script execution via heredoc
 - script execution via -e/-c flag
+- delete in root path
+- shell command via -c/-lc flag
 quick_commands: {}
 hooks: {}
 hooks_auto_accept: false
@@ -527,6 +516,20 @@ plugins:
   - evey-cache
   - evey-reflect
   - evey-validate
+mcp_servers:
+  openpets:
+    command: npx
+    args:
+    - '-y'
+    - '@open-pets/mcp@latest'
+    # Disabled 2026-05-27 after reviewing intent: OpenPets is presence
+    # telemetry, not a communication channel. The ambient hooks in
+    # cognitive_cycle.py + the auto-bubbles in musing_bubble.py cover
+    # everything Greg actually wanted (see the openpets-trim discussion).
+    # Toggle to true to re-enable Athena's deliberate openpets_say/react
+    # tools — but expect token cost on every deliberation prompt and
+    # consider whether the use case justifies it.
+    enabled: false
 
 # ── Fallback Model ────────────────────────────────────────────────────
 # Automatic provider failover when primary is unavailable.

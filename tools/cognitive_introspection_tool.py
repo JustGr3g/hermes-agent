@@ -137,6 +137,16 @@ def introspect_tool(args: dict, **kwargs) -> str:
     except Exception:
         pass
 
+    # Phase 14: full subsystem state for on-demand introspection.
+    # cognitive_state property already populates these keys; the tool
+    # previously dropped them. Now surfaced so Athena can answer
+    # "what patterns have you learned?" / "what's your aesthetic score?"
+    # directly from a tool call rather than guessing.
+    result["patterns"] = state.get("patterns", [])
+    result["aesthetic_scores"] = state.get("aesthetic_scores", {})
+    result["self_improvement"] = state.get("self_improvement", {})
+    result["decomposition_plans"] = state.get("decomposition_plans", [])
+
     return json.dumps(result, default=str)
 
 

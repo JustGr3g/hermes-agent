@@ -101,6 +101,142 @@ def _is_trivial_acknowledgment(text: str) -> bool:
     return False
 
 
+# ── Cognitive-subsystem renderer (Phase 14) ───────────────────────────────
+# Hard caps — tune these constants to control per-turn token cost.
+_COG_PATTERN_MAX = 5                 # max patterns shown per turn
+_COG_PATTERN_REC_LEN = 100          # chars: pattern recommendation
+_COG_IMPROVEMENT_PLAN_LEN = 120     # chars: self-improvement plan
+_COG_DECOMP_SUBTASK_LEN = 120       # chars: next subtask content
+_COG_DECOMP_GOAL_LEN = 80           # chars: goal description
+_COG_DECOMP_MAX_PLANS = 3           # max active plans shown
+
+
+def _render_cognitive_subsystems(
+    *,
+    patterns: list,
+    aesthetic: dict,
+    self_improvement: dict,
+    decomposition: list,
+) -> list[str]:
+    """Render PatternLearner / AestheticEvaluator / SelfImprovementLoop /
+    GoalDecomposer signals as a list of prompt lines.
+
+    Used by augment_message (per-turn) and get_system_prompt_block
+    (test / on-demand). Always emits a section when the subsystem has data;
+    skips silently when empty. Hard-capped on counts and field lengths —
+    worst-case ≈ 250–400 tokens per turn.
+
+    Never raises — subsystem read failures produce an empty return list.
+    """
+    lines: list[str] = []
+    try:
+        # ── Learned behavioral patterns ────────────────────────────────
+        active = [p for p in (patterns or []) if isinstance(p, dict)]
+        active = active[:_COG_PATTERN_MAX]
+        if active:
+            lines.append("")
+            lines.append("Learned behavioral patterns (act on these):")
+            for p in active:
+                rec = str(
+                    p.get("recommendation") or p.get("title") or ""
+                )[:_COG_PATTERN_REC_LEN]
+                conf = p.get("confidence", 0.0)
+                n = p.get("sample_count", 0)
+                if rec:
+                    lines.append(
+                        f"  • {rec} (confidence {conf:.0%}, seen {n}×)"
+                    )
+
+        # ── Aesthetic / editorial evaluation ──────────────────────────
+        if isinstance(aesthetic, dict) and aesthetic:
+            scores = aesthetic.get("aesthetic_scores") or {}
+            trend = aesthetic.get("trend", "")
+            overall = aesthetic.get("latest_overall")
+            if scores or overall is not None:
+                lines.append("")
+                lines.append("[ATHENA AESTHETIC STATE]")
+                dim_parts = []
+                for dim in (
+                    "concision", "effectiveness", "coherence",
+                    "naturalness", "consistency",
+                ):
+                    val = scores.get(dim)
+                    if val is not None:
+                        dim_parts.append(f"{dim[:4]}={val:.0%}")
+                overall_str = f"{overall:.0%}" if overall is not None else "n/a"
+                lines.append(
+                    f"  Overall: {overall_str}"
+                    + (f" | {' | '.join(dim_parts)}" if dim_parts else "")
+                )
+                if scores:
+                    weakest = min(scores, key=lambda k: scores.get(k, 1.0))
+                    weakest_val = scores[weakest]
+                    lines.append(
+                        f"  Weakest dimension: {weakest} ({weakest_val:.0%})"
+                    )
+                if trend and trend not in ("", "insufficient_data"):
+                    lines.append(f"  Trend: {trend}")
+
+        # ── Self-improvement ───────────────────────────────────────────
+        if isinstance(self_improvement, dict) and self_improvement:
+            tc = self_improvement.get("total_cycles", 0)
+            ac = self_improvement.get("active_cycles", 0)
+            cc = self_improvement.get("completed_cycles", 0)
+            fc = self_improvement.get("failed_cycles", 0)
+            top = self_improvement.get("top_weak_subsystem", "")
+            recent = self_improvement.get("recent_cycles") or []
+            if tc > 0 or recent:
+                lines.append("")
+                lines.append("[ATHENA SELF-IMPROVEMENT STATE]")
+                lines.append(
+                    f"  Cycles: {tc} total | {ac} active | "
+                    f"{cc} completed | {fc} failed"
+                )
+                if top and top not in ("none", ""):
+                    lines.append(f"  Focus area: {top}")
+                for cycle in recent[:1]:
+                    if not isinstance(cycle, dict):
+                        continue
+                    ws = cycle.get("weak_subsystem", "")
+                    plan = str(
+                        cycle.get("improvement_plan") or ""
+                    )[:_COG_IMPROVEMENT_PLAN_LEN]
+                    if ws or plan:
+                        if ws and plan:
+                            lines.append(
+                                f"  Current cycle: improving {ws} — {plan}"
+                            )
+                        else:
+                            lines.append(f"  Current cycle: {plan or ws}")
+
+        # ── Goal decomposition (next actionable steps) ─────────────────
+        active_plans = [
+            p for p in (decomposition or [])
+            if isinstance(p, dict) and p.get("next_subtask")
+        ][:_COG_DECOMP_MAX_PLANS]
+        if active_plans:
+            lines.append("")
+            lines.append("Active plan next steps:")
+            for p in active_plans:
+                goal = str(p.get("goal_content") or "")[:_COG_DECOMP_GOAL_LEN]
+                subtask = str(
+                    p.get("next_subtask") or ""
+                )[:_COG_DECOMP_SUBTASK_LEN]
+                milestone = p.get("current_milestone")
+                pct = p.get("progress_pct", 0.0)
+                suffix = f" [{milestone}]" if milestone else ""
+                lines.append(
+                    f"  • Goal: {goal} ({pct:.0%} done){suffix}"
+                )
+                lines.append(f"    → Next: {subtask}")
+
+    except Exception:
+        # Never let a rendering failure break the block builder.
+        pass
+
+    return lines
+
+
 class CognitiveProcessor:
     """
     Thin wrapper that injects ATHENA's 8 cognitive systems around each LLM call.
@@ -579,6 +715,21 @@ class CognitiveProcessor:
                     f'  "{winner_content[:300]}"'
                 )
 
+            # Phase 14: cognitive subsystem signals — PatternLearner,
+            # AestheticEvaluator, SelfImprovementLoop, GoalDecomposer.
+            # These run in heartbeat handlers; their output now surfaces
+            # every non-trivial turn so the reply-generating LLM can act
+            # on learned patterns, editorial trends, active improvement
+            # cycles, and next decomposition steps.
+            lines.extend(
+                _render_cognitive_subsystems(
+                    patterns=cog.get("patterns", []),
+                    aesthetic=cog.get("aesthetic", {}),
+                    self_improvement=cog.get("self_improvement", {}),
+                    decomposition=cog.get("decomposition", []),
+                )
+            )
+
             # Phase 12C.2: Citation discipline — instructs the LLM to mark
             # the source for every concrete claim. Greg can then tell at a
             # glance which assertions are grounded in real memory vs. guessed.
@@ -696,6 +847,17 @@ class CognitiveProcessor:
                 "`[from recent_self_steps: tool=X]`-style "
                 "citations: if the cog block lists tool=`(reflection)`, "
                 "don't cite tool=`opencode_run` based on intuition."
+            )
+            lines.append(
+                "- For claims about your learned behaviors or subsystem "
+                "states, use these specific citation tags: "
+                "`[from learned patterns]` (a PatternLearner recommendation), "
+                "`[from editorial signal]` (an AestheticEvaluator score or "
+                "trend), `[from self-improvement]` (a SelfImprovementLoop "
+                "cycle or focus area), `[from decomposition]` (a "
+                "GoalDecomposer next-step). These tags are verifiable — "
+                "only use them when the cited section above actually "
+                "contains the claim you're making."
             )
             lines.append(
                 "- For introspection or self-reflection questions "
@@ -894,6 +1056,10 @@ class CognitiveProcessor:
                     llm_client=getattr(ca.config, "fast_ollama_client", None)
                     or ca.config.ollama_client,
                     audit_callback=_audit,
+                    # 2026-05-25: historical-action claims (PAST_*) ground
+                    # against tool_outcomes — pass the agent's DB so the
+                    # new resolvers can query it.
+                    db_path=getattr(ca, "db_path", None),
                 )
 
             cog = self._last_cog or {}
@@ -1111,8 +1277,16 @@ class CognitiveProcessor:
 
     def get_system_prompt_block(self) -> str:
         """
-        Returns a system-prompt text block describing ATHENA's cognitive state.
-        Injected by CognitiveMemoryProvider.system_prompt_block().
+        Returns a text block describing ATHENA's cognitive state, formatted
+        for inclusion in a system prompt or on-demand view.
+
+        # DEPRECATED (per-turn path): subsystem signals now flow through
+        # augment_message via _render_cognitive_subsystems every non-trivial
+        # turn. This method's docstring previously claimed it was "Injected by
+        # CognitiveMemoryProvider.system_prompt_block()" — that was never
+        # true; the real Athena memory provider returns static text. This
+        # method is retained because tests exercise it and it is a convenient
+        # snapshot view; delete it in a future cleanup pass.
         """
         state = self.get_cognitive_state()
         if not state.get("initialized"):
@@ -1160,53 +1334,19 @@ class CognitiveProcessor:
         except Exception:
             pass
 
-        # Phase 13H #2: learned behavioral patterns
-        patterns = state.get("patterns", [])
-        if patterns:
-            lines.append("")
-            lines.append("Learned patterns from experience:")
-            for p in patterns:
-                title = p.get("title", "")[:80]
-                conf = p.get("confidence", 0.0)
-                samples = p.get("sample_count", 0)
-                lines.append(f"  • {title} (confidence {conf:.0%}, {samples} samples)")
-
-        # Phase 13H #5: aesthetic evaluation — editorial judgment / taste
-        aesthetic = state.get("aesthetic", {})
-        scores = aesthetic.get("aesthetic_scores", {}) or {}
-        trend = aesthetic.get("trend", "")
-        latest = aesthetic.get("latest_overall", 0.5)
-        if scores:
-            lines.append("")
-            lines.append("[ATHENA AESTHETIC STATE]")
-            dims = []
-            for dim in ("concision", "effectiveness", "coherence", "naturalness", "consistency"):
-                val = scores.get(dim, None)
-                if val is not None:
-                    dims.append(f"{dim[:4]}={val:.0%}")
-            lines.append(f"  Overall: {latest:.0%} | {' | '.join(dims)}")
-            if trend and trend != "insufficient_data":
-                lines.append(f"  Trend: {trend}")
-
-        # Phase 13H #6: structural self-improvement
-        si = state.get("self_improvement", {})
-        if si and si.get("total_cycles", 0) > 0:
-            lines.append("")
-            lines.append("[ATHENA SELF-IMPROVEMENT STATE]")
-            tc = si.get("total_cycles", 0)
-            cc = si.get("completed_cycles", 0)
-            fc = si.get("failed_cycles", 0)
-            lines.append(f"  Total cycles: {tc} | Completed: {cc} | Failed: {fc}")
-            top = si.get("top_weak_subsystem", "")
-            if top and top != "none":
-                lines.append(f"  Focus area: {top}")
-            recent = si.get("recent_cycles", [])
-            if recent:
-                latest = recent[0]
-                ws = latest.get("weak_subsystem", "")
-                plan = latest.get("improvement_plan", "")[:120]
-                if ws:
-                    lines.append(f"  Current focus: improving {ws}")
+        # Phase 14: delegate patterns / aesthetic / self-improvement /
+        # decomposition rendering to the shared helper so this method and
+        # augment_message stay in sync. get_cognitive_state() uses key
+        # "aesthetic" for the get_status_dict() result; decomposition is
+        # not yet tracked by get_cognitive_state() so pass empty list.
+        lines.extend(
+            _render_cognitive_subsystems(
+                patterns=state.get("patterns", []),
+                aesthetic=state.get("aesthetic", {}),
+                self_improvement=state.get("self_improvement", {}),
+                decomposition=[],
+            )
+        )
 
         lines.append("")
 

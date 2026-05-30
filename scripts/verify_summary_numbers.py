@@ -44,7 +44,16 @@ def _tool_truth(facts: dict) -> dict[str, dict]:
             continue
         ok = int(row.get("ok") or 0)
         fail = int(row.get("fail") or 0)
-        out[name] = {"ok": ok, "fail": fail, "total": ok + fail}
+        # daily_summary_facts.py now splits fail into genuine failures vs
+        # pre-execution anchor-guard rejections. A summary may legitimately
+        # report either the total fail or just real_fail — accept both.
+        real_fail = int(row.get("real_fail", fail) or 0)
+        out[name] = {
+            "ok": ok,
+            "fail": fail,
+            "real_fail": real_fail,
+            "total": ok + fail,
+        }
     return out
 
 
@@ -79,8 +88,9 @@ def _check_tool_claims(summary: str, truth: dict[str, dict]) -> list[str]:
                 # Compare against (fail, total) and (ok, total) — flag only if
                 # neither interpretation matches reality.
                 fits_fail = (claim_n == t["fail"] and claim_d == t["total"])
+                fits_real_fail = (claim_n == t["real_fail"] and claim_d == t["total"])
                 fits_ok = (claim_n == t["ok"] and claim_d == t["total"])
-                if not (fits_fail or fits_ok):
+                if not (fits_fail or fits_real_fail or fits_ok):
                     issues.append(
                         f"- `{tool_name}` claimed `{claim_n}/{claim_d}`; "
                         f"actual today: {t['ok']} ok / {t['fail']} fail "
@@ -90,10 +100,11 @@ def _check_tool_claims(summary: str, truth: dict[str, dict]) -> list[str]:
             # Bare "N failures" claims.
             for fc in _FAIL_COUNT_RE.finditer(window):
                 claim = int(fc.group(1))
-                if claim != t["fail"]:
+                if claim not in (t["fail"], t["real_fail"]):
                     issues.append(
                         f"- `{tool_name}` claimed `{claim} failures`; "
-                        f"actual today: {t['fail']}"
+                        f"actual: {t['fail']} total ({t['real_fail']} real, "
+                        f"{t['fail'] - t['real_fail']} anchor-rejected)"
                     )
 
             # Bare "N successes" claims.

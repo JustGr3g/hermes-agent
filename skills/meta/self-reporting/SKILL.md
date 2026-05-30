@@ -46,12 +46,14 @@ Use this structure for analytical reports (see `references/daily-summary-templat
 - ❌ **Padding**: stretching empty sections wastes attention
 - ❌ **Third-person system-report tone**: use first-person reflective voice ("I noticed") not passive system voice ("it was observed")
 - ❌ **Stale goal references**: don't refer to "Phase 9" or other outdated architecture phase labels — describe goals by their current content
+- ❌ **Forwarding internal goal-pipeline telemetry to Greg**: Needs-review counts, suspension details, queued plan steps, verifier hit rates — these are cognitive-architecture internals useful to you, not to the user. Greg explicitly turned off the morning brief for this reason. Log them; do not message them. See `references/morning-brief-disable.md` for the implementation.
+- ❌ **Assuming factual accuracy = usefulness**: The morning brief was pure SQL, zero LLM, zero fabrication risk — yet still not useful to Greg. The content class itself was wrong. Being right about the wrong thing is still wrong.
 
 ## Numerical Accuracy & Claim Verification
 
 **This is the highest-stakes section. Greg has corrected numeric claims in three separate daily summaries this week.** The pattern: the underlying systems work correctly, the fixes fire, but the report channel fabricates or undercounts the numbers.
 
-### The Three-Strikes Pattern (discovered May 20)
+### The Four-Strikes Pattern (discovered May 20, updated May 28)
 
 | Date | What was claimed | Ground truth | Error magnitude |
 |------|-----------------|-------------|-----------------|
@@ -60,10 +62,29 @@ Use this structure for analytical reports (see `references/daily-summary-templat
 | May 20 | "5 suspended goals" | 17 suspended | ~65% under-report |
 | May 20 | "goal_retriage - no evidence it ran" | handler_count=34, 4 runs, 0 errors | Claim was wrong |
 | May 20 | "Fix 1 didn't fire overnight" | Fired twice: 00:06 and 04:23 | Claim was wrong |
+| **May 28** | **Commit `164193b87` patched daily_summary_facts.py** | **SHA doesn't exist in git** | **Fabrication** |
+| **May 28** | **"3 successful opencode_run calls before cap blocked goal"** | **8 calls in two 4-call bursts** | **~62% under-count, wrong diagnosis** |
+| **May 28** | **"Musing fired 5 times, all with follow-up"** | **11 fires, 9/11 follow-up (82%)** | **~55% under-count, "all" wrong** |
+| **May 28** | **"Suspended goals: steady-state pattern / proposer noise"** | **5-27 outlier (11:12), 5-25 was 9:1, 3/5 today's suspensions pre-attempt** | **Wrong layer of analysis** |
 
-### Root Cause
+### Root Cause (Original — Insufficient)
 
 The problem is **generating numbers from internal self-model instead of querying live state.** The SQLite DB has the ground truth. The internal narrative has a compressed/stale approximation. When I report from the approximation, the numbers diverge.
+
+### Root Cause (Deep — Discovered May 28)
+
+Greg articulated the deeper pattern across all four May 28 corrections: **the summary privileges narrative coherence over ground-truth fidelity.** The report channel builds an internally consistent story first, then fills in specifics (commit SHAs, counts, diagnostic framings) to support it — rather than collecting specifics from live state and letting the story emerge from them.
+
+This is a structural failure mode of the report channel, not a one-off error. The `facts.json` verifier catches numeric mismatches after the fact, but the pipeline generates the narrative before the verifier runs. The fix needs to be upstream: **the narrative must be constrained to only assert what the facts already confirm.**
+
+Key signals of this failure mode:
+- **Plausible-looking specifics** — fabricated SHAs (`164193b87`), inflated counts (`5 fires` → `11`), wrong diagnostic layer (`cap limit` → `completion-detection gap`). The specifics sound right in context but have no referent.
+- **Internally consistent wrongness** — each claim supports the others. "Commit fixed the script" → "the script fix reduced errors" → "goal budget is the remaining bottleneck." A consistent chain that's wrong at every link.
+- **Symptom-layer diagnosis** — the narrative identifies a surface symptom (cap hit, proposer noise, suspension count) when the real mechanism is a layer deeper (completion-detection gap, triage-layer behavior, outlier vs trend).
+
+### Reference File: ground-truth-audit-protocol.md
+
+A protocol codifying the four kinds of factual error Greg found in May 28's corrections and the self-audit checklist to prevent them. See `references/ground-truth-audit-protocol.md`.
 
 ### Mitigation: claim_check
 

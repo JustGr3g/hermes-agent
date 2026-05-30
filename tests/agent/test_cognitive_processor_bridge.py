@@ -198,3 +198,176 @@ class TestSystemPromptBlockToolRates:
         block = cp.get_system_prompt_block()
         assert isinstance(block, str)
         assert "ATHENA COGNITIVE STATE" in block
+
+
+# ── Phase 14: _render_cognitive_subsystems ────────────────────────────
+
+from agent.cognitive_processor import _render_cognitive_subsystems
+
+
+class TestRenderCognitiveSubsystems:
+    """_render_cognitive_subsystems produces correct prompt lines."""
+
+    # ── Patterns ──────────────────────────────────────────────────────
+
+    def test_patterns_render_recommendation(self):
+        patterns = [
+            {"recommendation": "Prefer rg over grep", "confidence": 0.8, "sample_count": 5},
+        ]
+        lines = _render_cognitive_subsystems(
+            patterns=patterns, aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        block = "\n".join(lines)
+        assert "Prefer rg over grep" in block
+        assert "80%" in block
+        assert "5×" in block
+
+    def test_patterns_empty_produces_no_section(self):
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        assert not any("Learned behavioral" in l for l in lines)
+
+    def test_patterns_capped_at_max(self):
+        patterns = [
+            {"recommendation": f"rec {i}", "confidence": 0.9, "sample_count": 1}
+            for i in range(10)
+        ]
+        lines = _render_cognitive_subsystems(
+            patterns=patterns, aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        # At most _COG_PATTERN_MAX (5) bullet lines
+        bullet_lines = [l for l in lines if l.strip().startswith("•")]
+        assert len(bullet_lines) <= 5
+
+    def test_patterns_missing_recommendation_uses_title(self):
+        patterns = [{"title": "fallback title", "confidence": 0.6, "sample_count": 2}]
+        lines = _render_cognitive_subsystems(
+            patterns=patterns, aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        assert any("fallback title" in l for l in lines)
+
+    # ── Aesthetic ─────────────────────────────────────────────────────
+
+    def test_aesthetic_renders_overall_and_dims(self):
+        aesthetic = {
+            "aesthetic_scores": {"concision": 0.4, "effectiveness": 0.7},
+            "latest_overall": 0.55,
+            "trend": "declining",
+        }
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic=aesthetic, self_improvement={}, decomposition=[]
+        )
+        block = "\n".join(lines)
+        assert "AESTHETIC STATE" in block
+        assert "55%" in block
+        assert "declining" in block
+
+    def test_aesthetic_empty_produces_no_section(self):
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        assert not any("AESTHETIC" in l for l in lines)
+
+    def test_aesthetic_shows_weakest_dimension(self):
+        aesthetic = {
+            "aesthetic_scores": {
+                "concision": 0.3, "effectiveness": 0.8, "coherence": 0.9,
+                "naturalness": 0.7, "consistency": 0.85,
+            },
+            "latest_overall": 0.73,
+            "trend": "stable",
+        }
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic=aesthetic, self_improvement={}, decomposition=[]
+        )
+        block = "\n".join(lines)
+        assert "concision" in block  # weakest at 0.3
+
+    # ── Self-improvement ──────────────────────────────────────────────
+
+    def test_self_improvement_renders_active_cycle(self):
+        si = {
+            "total_cycles": 2,
+            "active_cycles": 1,
+            "completed_cycles": 1,
+            "failed_cycles": 0,
+            "top_weak_subsystem": "concision",
+            "recent_cycles": [
+                {
+                    "status": "in_progress",
+                    "weak_subsystem": "concision",
+                    "improvement_plan": "Shorten replies; target concision > 0.6",
+                }
+            ],
+        }
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement=si, decomposition=[]
+        )
+        block = "\n".join(lines)
+        assert "SELF-IMPROVEMENT" in block
+        assert "concision" in block
+        assert "Shorten replies" in block
+
+    def test_self_improvement_empty_produces_no_section(self):
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        assert not any("SELF-IMPROVEMENT" in l for l in lines)
+
+    # ── Decomposition ─────────────────────────────────────────────────
+
+    def test_decomposition_renders_next_subtask(self):
+        decomp = [
+            {
+                "goal_content": "Improve response concision",
+                "progress_pct": 0.25,
+                "current_milestone": "Research",
+                "next_subtask": "Read 3 concision papers from the vault",
+            }
+        ]
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=decomp
+        )
+        block = "\n".join(lines)
+        assert "Read 3 concision papers" in block
+        assert "25%" in block
+
+    def test_decomposition_skips_plan_without_next_subtask(self):
+        decomp = [
+            {"goal_content": "Done goal", "progress_pct": 1.0,
+             "current_milestone": None, "next_subtask": None}
+        ]
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=decomp
+        )
+        assert not any("Next:" in l for l in lines)
+
+    # ── Safety / None-guards ───────────────────────────────────────────
+
+    def test_all_empty_returns_empty_list(self):
+        lines = _render_cognitive_subsystems(
+            patterns=[], aesthetic={}, self_improvement={}, decomposition=[]
+        )
+        assert isinstance(lines, list)
+        assert not any(
+            kw in "\n".join(lines)
+            for kw in ("Learned behavioral", "AESTHETIC", "SELF-IMPROVEMENT", "plan next")
+        )
+
+    def test_none_inputs_do_not_raise(self):
+        """None inputs should be handled gracefully (never raise)."""
+        lines = _render_cognitive_subsystems(
+            patterns=None,        # type: ignore[arg-type]
+            aesthetic=None,       # type: ignore[arg-type]
+            self_improvement=None,  # type: ignore[arg-type]
+            decomposition=None,   # type: ignore[arg-type]
+        )
+        assert isinstance(lines, list)
+
+    def test_malformed_pattern_dicts_do_not_raise(self):
+        patterns = [None, 42, {"recommendation": "ok", "confidence": 0.9, "sample_count": 1}]
+        lines = _render_cognitive_subsystems(
+            patterns=patterns, aesthetic={}, self_improvement={}, decomposition=[]  # type: ignore
+        )
+        assert isinstance(lines, list)

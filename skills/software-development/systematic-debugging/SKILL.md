@@ -21,6 +21,8 @@ Random fixes waste time and create new bugs. Quick patches mask underlying issue
 
 **Violating the letter of this process is violating the spirit of debugging.**
 
+> **Reference file:** `references/claim-verification.md` — protocol for independently verifying deployment claims against live runtime state. Use when someone tells you what changed in a running system.
+
 ## The Iron Law
 
 ```
@@ -350,6 +352,51 @@ If you catch yourself thinking:
 **ALL of these mean: STOP. Return to Phase 1.**
 
 **If 3+ fixes failed:** Question the architecture (Phase 4 step 5).
+
+### Silent Exception Swallowing — The Invisible Subsystem Trap
+
+A particularly insidious failure mode in Python codebases: **`except Exception:»pass` (or bare `except Exception:»return default`) that makes a subsystem silently invisible.**
+
+Symptoms to watch for:
+- A function returns a plausible-looking default (empty list, empty dict, empty `nx.Graph()`) instead of raising
+- The error is logged at `debug` or `warning` level (not `error`) — visible in log analysis but never surfaced to the runtime
+- Data arrives at a subsystem's entry point (confirmed via logs) but produces no effect downstream
+- The module appears loaded and imported correctly — no ImportError — but produces no output
+
+Detection pattern when you suspect silent swallowing:
+```python
+# 1. Read the actual function body — don't trust what it "should" do
+read_file(path, offset=N, limit=M)  # Read the except block
+
+# 2. Check whether the except clause logs the error or swallows it silently
+# If it only logs at debug/warning AND returns a default → silent swallowing
+
+# 3. Read the raw stored data directly (bypassing the deserializer)
+# Example: open the SQLite blob, read the JSON, try parsing it with the SAME
+# library version that the function uses
+```
+
+**Real-world example discovered May 22, 2026:** `GraphSerializer.deserialize()` in `cognitive_agent/persistence.py` wraps `nx.node_link_graph(data)` in a bare `except Exception` that returns `nx.Graph()` — an empty graph. A legacy blob used `"edges"` as the edge-list key but nx 3.x expects `"links"`, so every load silently returned an empty graph. 6,642 nodes and 75,852 edges persisted in SQLite but the runtime never saw them. Fix: `nx.node_link_graph(data, link='edges')` handles both key conventions.
+
+**Detection sequence that found it (reusable for similar cases):**
+1. **Check the stored data directly**, bypassing the deserializer — open the file/DB, read the raw blob, parse it with the same library version:
+   ```python
+   row = conn.execute("SELECT graph_json FROM graph_state").fetchone()
+   data = json.loads(row[0])
+   G = nx.node_link_graph(data, directed=False)  # ← THIS fails
+   ```
+2. **Inspect the data's actual key names** — if the blob uses a different key convention than the deserializer expects, that's the smoking gun:
+   ```python
+   print(list(data.keys()))  # ['directed', 'multigraph', 'graph', 'nodes', 'edges']
+   ```
+3. **Try both key conventions** — `nx.node_link_graph(data, link='edges')` vs default `link='links'` — to see which succeeds.
+4. **Confirm via an independent consumer** — if the blob has data but the loaded graph is empty, the deserializer is the problem:
+   ```python
+   data['links'] = data.pop('edges')
+   G = nx.node_link_graph(data)  # now works
+   ```
+
+The key insight: **a function that returns an empty default instead of raising is indistinguishable from "nothing stored yet"** unless you independently verify the persisted data. The detection pattern is: **read the raw store directly** — if the store has data and the runtime returns empty, the deserialization layer is the problem.
 
 ## Common Rationalizations
 

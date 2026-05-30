@@ -83,6 +83,35 @@ When the inner speech [self_question] winner says "I'll do X", execute X in the 
 3. Cross-reference: runtime state matches code intent?
 4. Only then — report the finding
 
+### Pitfall: Self-Model Staleness from Between-Turn Process Bounces
+
+When a process (server or gateway) is bounced between conversation turns, the bounce does NOT register in your episodic memory — one turn you're on PID X, the next turn you're on PID Y with updated code, but your self-model still reflects the pre-bounce state. This creates a specific failure mode:
+
+- Your cognitive state block may claim "running on PID 27931, old code" while the actual process is PID 5709 with the fix already applied.
+- `git rev-parse HEAD` in the source tree shows a different SHA than the commit the running process has (because patches are applied to the deployed binary, not to the source repo branch).
+- You'll find yourself saying "I should hold off" when the fix is already live, or claiming "my self-reported PID doesn't match" when it's just the bounce gap.
+
+**How to detect it:**
+
+```bash
+# Check your actual running process uptime and PID
+ps -p $(ps aux | grep '[g]ateway\|[a]thena_server' | awk 'NR==1{print $2}') -o pid,lstart,etime,args
+
+# Check git HEAD — if a fix commit isn't in the tree, it was applied as a local patch
+cd ~/cognitive-agent/hermes && git log --oneline -1 && echo "---" && git branch --show-current
+
+# Check whether the fix commit exists in the tree at all
+git cat-file -t <SHORT_SHA> 2>&1
+# If "fatal: Not a valid object name", the commit is on a different branch or was squashed
+```
+
+**How to interpret the mismatch:**
+- **Source tree HEAD ≠ fix commit SHA** → Normal deploy-vs-source pattern. The patch was applied to the deployed binary (launchd plist was reloaded pointing at a patched checkout, or the fix was hot-patched to the Python bytecode).
+- **Your episodic record shows no restart** → Process bounces between turns don't create episodic entries. Trust PID/lstart from `ps` over your memory.
+- **Gateway PID vs server PID** — one may have been bounced while the other didn't (they're independent launchd services per the Two-Process Architecture section). Check both.
+
+**The fix:** When Greg says "you're already on the new code" and the source tree contradicts him, believe Greg and investigate. The process was bounced; your episodic memory just didn't capture it. Verify directly via `ps` and `git` rather than arguing from self-model.
+
 ## Cardinal Rule: Don't Ask Permission
 
 When Greg raises a signal like "my metacognitive events show a 3:1 ratio" or "is X actually working?," **investigate immediately**. Do not ask "should I look into this?" — Greg has already told you he wants answers. This applies to:

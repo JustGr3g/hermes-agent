@@ -126,7 +126,7 @@ def _get_backend() -> str:
     keys manually without running setup.
     """
     configured = (_load_web_config().get("backend") or "").lower().strip()
-    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs"):
+    if configured in ("parallel", "firecrawl", "tavily", "exa", "searxng", "brave-free", "ddgs", "ollama"):
         return configured
 
     # Fallback for manual / legacy config — pick the highest-priority
@@ -204,6 +204,8 @@ def _is_backend_available(backend: str) -> bool:
         return _has_env("BRAVE_SEARCH_API_KEY")
     if backend == "ddgs":
         return _ddgs_package_importable()
+    if backend == "ollama":
+        return bool(_has_env("OLLAMA_API_KEY") or _has_env("ATHENA_OLLAMA_API_KEY"))
     return False
 
 
@@ -1240,6 +1242,16 @@ def web_search_tool(query: str, limit: int = 5) -> str:
         if backend == "ddgs":
             from tools.web_providers.ddgs import DDGSSearchProvider
             response_data = DDGSSearchProvider().search(query, limit)
+            debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
+            result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
+            debug_call_data["final_response_size"] = len(result_json)
+            _debug.log_call("web_search_tool", debug_call_data)
+            _debug.save()
+            return result_json
+
+        if backend == "ollama":
+            from tools.web_providers.ollama_search import OllamaSearchProvider
+            response_data = OllamaSearchProvider().search(query, limit)
             debug_call_data["results_count"] = len(response_data.get("data", {}).get("web", []))
             result_json = json.dumps(response_data, indent=2, ensure_ascii=False)
             debug_call_data["final_response_size"] = len(result_json)

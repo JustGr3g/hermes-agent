@@ -53,6 +53,23 @@ def _yesterday_bounds() -> tuple[float, float]:
     return (yest_start.timestamp(), today_start.timestamp())
 
 
+def _rolling_24h_bounds() -> tuple[float, float]:
+    """Return (now-24h, now) epoch.
+
+    The cron fires at ~06:30 local, so `_today_bounds()` ("local midnight →
+    now") only covers ~6.5h of mostly-overnight time — Athena's quietest
+    window. Activity that ran steadily until late the previous evening shows
+    up as ZERO under that window, which is what produced the recurring
+    "Musing didn't fire / opencode stopped / X is broken" false alarms (see
+    notes/routine-2026-05-27.md, -05-29.md, -05-30.md: musing fired 16× on
+    2026-05-29 but 0× after local midnight, so the calendar-day window read
+    it as "never fired"). For overnight-activity metrics (musing, synth
+    markers, tool fires, goal transitions) a rolling 24h window is the
+    correct denominator at summary time."""
+    now = datetime.datetime.now()
+    return ((now - datetime.timedelta(hours=24)).timestamp(), now.timestamp())
+
+
 _WEEKDAY_SHORT = ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")
 
 
@@ -152,6 +169,20 @@ def gather() -> dict:
             (yest_start, yest_end),
         ).fetchall()
         out["goals_created_yesterday_by_status"] = {r[0]: r[1] for r in rows}
+        # Rolling-24h goal transitions BY updated_at. The morning summary
+        # repeatedly compared incompatible windows — e.g. "4 suspended vs 7
+        # completed" took today's (overnight-only) suspensions and
+        # yesterday's full-day completions, an apples-to-oranges ratio
+        # (notes/routine-2026-05-30.md). This single consistent-window block
+        # is the canonical "recent goal activity" denominator — suspended vs
+        # completed should only ever be compared within it.
+        win_start, _now2 = _rolling_24h_bounds()
+        rows = conn.execute(
+            "SELECT status, COUNT(*) FROM goals "
+            "WHERE updated_at >= ? GROUP BY status ORDER BY 2 DESC",
+            (win_start,),
+        ).fetchall()
+        out["goals_transitions_24h_by_status"] = {r[0]: r[1] for r in rows}
         # Recent completed (titles)
         rows = conn.execute(
             "SELECT substr(id,1,8), substr(content,1,80) FROM goals "
@@ -191,19 +222,42 @@ def gather() -> dict:
     # They surface separately under synth_markers_today below.
     try:
         conn = sqlite3.connect(DB)
-        today_start, _now = _today_bounds()
+        # Rolling 24h, not calendar-day-so-far — see _rolling_24h_bounds().
+        win_start, _now = _rolling_24h_bounds()
+        # A "validation rejection" is a success=0 row that never ran the tool:
+        # the dispatch/validation guard rejected it pre-execution (latency ~0)
+        # — most commonly opencode_run's anchor guard rejecting an abstract
+        # prompt. Counting these as "failures" produced the misleading
+        # "opencode_run 26% failure rate / reliability bottleneck" claim
+        # (notes/routine-2026-05-30.md): of 6 opencode_run failures, 5 were
+        # 0ms anchor-guard rejections, only 1 was a real subprocess failure.
+        # Split them out so the summary distinguishes reliability from
+        # proposer-quality signal.
         rows = conn.execute(
             "SELECT tool_name, "
             "  SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, "
             "  SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS fail, "
-            "  ROUND(AVG(latency_ms), 1) AS avg_ms "
+            "  SUM(CASE WHEN success=0 AND (latency_ms < 50 "
+            "      OR error LIKE '%no concrete anchor%' "
+            "      OR error LIKE '%anchor guard%') THEN 1 ELSE 0 END) AS rejected, "
+            "  ROUND(AVG(CASE WHEN success=1 THEN latency_ms END), 1) AS avg_ok_ms "
             "FROM tool_outcomes WHERE timestamp >= ? "
             "  AND tool_name NOT LIKE 'synth:%' "
             "GROUP BY tool_name ORDER BY (ok+fail) DESC",
-            (today_start,),
+            (win_start,),
         ).fetchall()
         out["tool_fires_today"] = [
-            {"tool": r[0], "ok": r[1], "fail": r[2], "avg_ms": r[3]} for r in rows
+            {
+                "tool": r[0],
+                "ok": r[1],
+                "fail": r[2],
+                # Genuine failures that actually ran the tool, vs pre-exec
+                # guard rejections. real_fail + validation_rejected == fail.
+                "real_fail": r[2] - r[3],
+                "validation_rejected": r[3],
+                "avg_ms": r[4],
+            }
+            for r in rows
         ]
         # Separate synth-marker rollup so the cycle's no_tool_resolution
         # behavior remains visible — but framed correctly as "abstract
@@ -214,7 +268,7 @@ def gather() -> dict:
             "FROM tool_outcomes WHERE timestamp >= ? "
             "  AND tool_name LIKE 'synth:%' "
             "GROUP BY tool_name ORDER BY n DESC",
-            (today_start,),
+            (win_start,),
         ).fetchall()
         out["synth_markers_today"] = [
             {"marker": r[0], "count": r[1], "avg_decide_latency_ms": r[2]}
@@ -235,14 +289,20 @@ def gather() -> dict:
     # hasn't fired" when it has (see notes/routine-2026-05-27.md §4.3).
     try:
         conn = sqlite3.connect(DB)
-        today_start, _now = _today_bounds()
+        # Rolling 24h, NOT calendar-day-so-far. Musing runs through the
+        # evening and goes quiet overnight; at the 06:30 cron the local-day
+        # window (00:00→06:30) catches only the quiet hours and reads "0
+        # fires" even when musing fired 16× the prior day (last fire 23:50).
+        # That is the exact recurring false alarm this fix targets — see
+        # _rolling_24h_bounds() and notes/routine-2026-05-30.md.
+        win_start, _now = _rolling_24h_bounds()
         rows = conn.execute(
             "SELECT timestamp, context, COALESCE(data, '{}') "
             "FROM metacognitive_events "
             "WHERE timestamp >= ? "
             "  AND context IN ('stuck_cycle_musing', 'stuck_cycle_force_propose') "
             "ORDER BY timestamp DESC",
-            (today_start,),
+            (win_start,),
         ).fetchall()
         musing_fires = []
         force_propose_fires = 0
@@ -260,11 +320,11 @@ def gather() -> dict:
                 "has_followup": bool(d.get("has_followup", False)),
                 "thought_preview": str(d.get("thought_preview", ""))[:140],
             })
-        out["musing_fires_today"] = musing_fires
-        out["musing_followup_count_today"] = sum(
+        out["musing_fires_24h"] = musing_fires
+        out["musing_followup_count_24h"] = sum(
             1 for m in musing_fires if m["has_followup"]
         )
-        out["force_propose_fallback_today"] = force_propose_fires
+        out["force_propose_fallback_24h"] = force_propose_fires
     except Exception as e:
         out["musing_error"] = str(e)
     finally:
@@ -425,9 +485,27 @@ def render_markdown(facts: dict) -> str:
         lines.append(f"- {s}: {n}")
     lines.append("")
 
-    lines.append("## Goals created today / yesterday\n")
-    lines.append(f"- Today: {facts.get('goals_created_today_by_status', {})}")
-    lines.append(f"- Yesterday: {facts.get('goals_created_yesterday_by_status', {})}")
+    lines.append("## Goal transitions — last 24h (canonical recent activity)\n")
+    lines.append(f"- {facts.get('goals_transitions_24h_by_status', {})}")
+    lines.append(
+        "\n_This is the ONLY window to use when comparing suspended vs "
+        "completed vs abandoned. It counts goals by `updated_at` over a "
+        "rolling 24h. Do NOT build a 'suspended vs completed' ratio by "
+        "mixing the today/yesterday rows below — at 06:30 'today' is only "
+        "the overnight hours, so pairing today-suspended with yesterday-"
+        "completed gives a false ratio (the 2026-05-30 '4 suspended vs 7 "
+        "completed' error)._"
+    )
+    lines.append("")
+
+    lines.append("## Goals created today / yesterday (by created_at — reference only)\n")
+    lines.append(f"- Today (overnight only): {facts.get('goals_created_today_by_status', {})}")
+    lines.append(f"- Yesterday (full day): {facts.get('goals_created_yesterday_by_status', {})}")
+    lines.append(
+        "\n_These two rows cover DIFFERENT-LENGTH windows and count creation, "
+        "not outcome. Use the 'Goal transitions — last 24h' block above for "
+        "any completed/suspended/abandoned comparison._"
+    )
     lines.append("")
 
     if facts.get("recent_completed_goals"):
@@ -445,11 +523,29 @@ def render_markdown(facts: dict) -> str:
             )
         lines.append("")
 
-    lines.append("## Tool fires today (success / fail / avg latency)\n")
+    lines.append(
+        "## Tool fires — last 24h (ok / real_fail / anchor_rejected / avg latency)\n"
+    )
     for t in facts.get("tool_fires_today", []):
-        lines.append(
-            f"- {t['tool']}: ok={t['ok']} fail={t['fail']} avg_ms={t['avg_ms']}"
-        )
+        rej = t.get("validation_rejected", 0) or 0
+        real = t.get("real_fail", t.get("fail", 0))
+        seg = f"- {t['tool']}: ok={t['ok']} real_fail={real}"
+        if rej:
+            seg += f" anchor_rejected={rej}"
+        seg += f" avg_ok_ms={t['avg_ms']}"
+        lines.append(seg)
+    lines.append("")
+    lines.append(
+        "_**`anchor_rejected`** counts success=0 rows the dispatch/anchor "
+        "guard rejected BEFORE running the tool (≈0ms) — almost always "
+        "opencode_run declining an abstract, anchorless prompt. These are "
+        "NOT reliability failures; they are a proposer-quality signal (a goal "
+        "with no concrete file/identifier to act on). Report reliability "
+        "using `real_fail` only, and mention `anchor_rejected` separately as "
+        "'abstract goals the anchor guard declined' — do NOT fold them into a "
+        "single 'X% failure rate' for the tool. `avg_ok_ms` is the latency of "
+        "successful runs only, so rejections don't deflate it._"
+    )
     lines.append("")
     lines.append(
         "_`synth:*` rows are NOT in the list above. They are post-hoc "
@@ -461,7 +557,7 @@ def render_markdown(facts: dict) -> str:
 
     synth = facts.get("synth_markers_today", []) or []
     lines.append(
-        f"## Synth markers today (no_tool_resolution etc.): "
+        f"## Synth markers — last 24h (no_tool_resolution etc.): "
         f"{sum(m['count'] for m in synth)}\n"
     )
     if synth:
@@ -482,11 +578,11 @@ def render_markdown(facts: dict) -> str:
         lines.append("- (zero synth markers today)")
     lines.append("")
 
-    musing_fires = facts.get("musing_fires_today", []) or []
-    followup_n = facts.get("musing_followup_count_today", 0)
-    force_n = facts.get("force_propose_fallback_today", 0)
+    musing_fires = facts.get("musing_fires_24h", []) or []
+    followup_n = facts.get("musing_followup_count_24h", 0)
+    force_n = facts.get("force_propose_fallback_24h", 0)
     lines.append(
-        f"## Musing activity today (Crystalline Quilt P1): "
+        f"## Musing activity — last 24h (Crystalline Quilt P1): "
         f"{len(musing_fires)} fires, {followup_n} with follow-up action\n"
     )
     if musing_fires:
@@ -494,7 +590,11 @@ def render_markdown(facts: dict) -> str:
             "Each row is a `stuck_cycle_musing` metacog event — Musing "
             "fired, the LLM crystallized a thought, and decided whether "
             "to propose a follow-up action. `has_followup=False` is a "
-            "first-class outcome (sitting with the thought is fine)."
+            "first-class outcome (sitting with the thought is fine). "
+            "**This is a rolling 24h count.** Musing runs through the "
+            "evening and goes quiet overnight, so if the most recent fire "
+            "is several hours before this cron, that is normal — do NOT "
+            "write 'Musing didn't fire today' or infer the flag is off."
         )
         lines.append("")
         for m in musing_fires[:8]:
@@ -507,7 +607,8 @@ def render_markdown(facts: dict) -> str:
             lines.append(f"- … and {len(musing_fires) - 8} more")
     else:
         lines.append(
-            "- (Musing did not fire today — either the runtime flag "
+            "- (Musing did not fire in the last 24h — only now, after a full "
+            "24h of zero fires, is it worth checking whether the runtime flag "
             "`athena_musing_enabled` is off, no focus accumulated, or no "
             "`no_top_goal` stuck-cycle was hit)"
         )

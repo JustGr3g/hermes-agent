@@ -1,115 +1,183 @@
 /**
- * Forum — root component for the dashboard tab.
+ * Forum — the living instrument.
  *
- * Phase 2 (static composition): renders the Canvas 2D scene with all
- * five elements visible as static placeholders. The Phase 1 diagnostic
- * cards (connection status, raw state) are kept below the canvas as a
- * collapsed details block so the contemplative composition is the
- * primary experience.
+ * A legible real-time view of Athena's cognition. Four zones:
+ *   - Masthead     — title, alive indicator, cognitive step
+ *   - Cardiogram   — the heartbeat trace (hero element)
+ *   - NOW          — current goal + last tool + vitals
+ *   - STREAM       — the scrolling feed of typed activity events
  *
- * Phases 3+ add live data encoding, motion, interactions, and depth.
+ * Data: a 1.5s poll of /api/plugins/forum/events, which tails Athena's
+ * real event tables. No abstract encoding — everything is shown.
  */
 
-import {
-  React,
-  useEffect,
-  useState,
-  Card,
-  CardHeader,
-  CardTitle,
-  CardContent,
-  Badge,
-  fetchJSON,
-} from './sdk';
-import { useForumState } from './data/useForumState';
-import { ForumCanvas } from './canvas/ForumCanvas';
+import { React, useEffect, useRef, useState } from './sdk';
+import { theme } from './design/theme';
+import { useForumFeed } from './data/useForumFeed';
+import { useInterpretation } from './data/useInterpretation';
+import { Masthead } from './instrument/Masthead';
+import { Cardiogram } from './instrument/Cardiogram';
+import { Reading } from './instrument/Reading';
+import { CurrentFocus } from './instrument/CurrentFocus';
+import { Vitals } from './instrument/Vitals';
+import { EventStream } from './instrument/EventStream';
 
-function StatusBadge({ status }: { status: string }) {
-  const variant: string =
-    status === 'open' ? 'default' :
-    status === 'connecting' ? 'secondary' :
-    status === 'error' ? 'destructive' :
-    'outline';
-  return <Badge variant={variant}>{status}</Badge>;
+const STYLE = `
+@keyframes forum-row-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to   { opacity: 1; transform: translateY(0); }
 }
+.forum-row-in { animation: forum-row-in 360ms cubic-bezier(0,0,0.2,1); }
+.forum-row { transition: background-color 120ms ease; }
+.forum-row:hover { background-color: ${theme.bgRaised}; }
+@keyframes forum-alive {
+  0%, 100% { opacity: 1;   transform: scale(1); }
+  50%      { opacity: 0.45; transform: scale(0.82); }
+}
+.forum-alive-dot { animation: forum-alive 2.6s ease-in-out infinite; }
+.forum-scroll::-webkit-scrollbar { width: 7px; }
+.forum-scroll::-webkit-scrollbar-thumb {
+  background: ${theme.border}; border-radius: 4px;
+}
+.forum-scroll::-webkit-scrollbar-track { background: transparent; }
+`;
 
-function formatAge(ts: number | null): string {
-  if (ts === null) return '—';
-  const ageSec = Math.floor((Date.now() - ts) / 1000);
-  if (ageSec < 60) return `${ageSec}s ago`;
-  if (ageSec < 3600) return `${Math.floor(ageSec / 60)}m ago`;
-  return `${Math.floor(ageSec / 3600)}h ago`;
+function ZoneLabel({ children }: { children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace',
+        fontSize: 10,
+        letterSpacing: '0.16em',
+        textTransform: 'uppercase',
+        color: theme.textFaint,
+        marginBottom: 12,
+      }}
+    >
+      {children}
+    </div>
+  );
 }
 
 export function Forum() {
-  const { state, status, lastUpdateAt } = useForumState();
-  const [pluginHealth, setPluginHealth] = useState<unknown>(null);
+  const feed = useForumFeed();
+  const { interpretation, loading: interpLoading } = useInterpretation();
   const [, setTick] = useState(0);
 
+  // Track when the latest serverTime arrived so age labels can advance
+  // smoothly between 1.5s polls.
+  const serverRef = useRef<{ t: number; recv: number } | null>(null);
+  if (feed.serverTime != null && serverRef.current?.t !== feed.serverTime) {
+    serverRef.current = { t: feed.serverTime, recv: Date.now() };
+  }
+
+  // 1s ticker so "12s ago" labels count up.
   useEffect(() => {
     const i = window.setInterval(() => setTick((n: number) => n + 1), 1000);
     return () => clearInterval(i);
   }, []);
 
-  useEffect(() => {
-    fetchJSON('/api/plugins/forum/health')
-      .then((d: unknown) => setPluginHealth(d))
-      .catch(() => setPluginHealth({ error: 'plugin backend unreachable' }));
-  }, []);
+  const displayNow = serverRef.current
+    ? serverRef.current.t + (Date.now() - serverRef.current.recv) / 1000
+    : Date.now() / 1000;
+
+  // Rolling events-per-minute — a meaningful, restart-stable liveness
+  // number (replaces the cognitive `step` counter, which reset to 0
+  // every server restart).
+  const eventsPerMin = feed.events.filter((e) => e.ts > displayNow - 60).length;
 
   return (
-    <div className="flex flex-col gap-4 h-full">
-      {/*
-        The contemplative canvas takes the bulk of the page. Min-height
-        ensures it's substantial even on short viewports; aspect ratio
-        gives it a horizontal composition (3:1 is wider than the live
-        Forum will be in fullscreen, but works for an embedded tab).
-      */}
+    <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
+      <style>{STYLE}</style>
+
       <div
         style={{
-          width: '100%',
-          aspectRatio: '16 / 9',
-          minHeight: '480px',
-          maxHeight: '75vh',
-          borderRadius: '8px',
-          overflow: 'hidden',
-          background: '#0a0e1c',
+          display: 'flex',
+          flexDirection: 'column',
+          background: theme.bg,
+          border: `1px solid ${theme.border}`,
+          borderRadius: 10,
+          padding: '20px 22px',
+          minHeight: 600,
+          gap: 4,
+          // Neutralize the host theme (e.g. "cyberpunk") forcing
+          // uppercase on everything — long sentences in all-caps are
+          // exhausting. Labels re-apply uppercase explicitly.
+          textTransform: 'none',
         }}
       >
-        <ForumCanvas />
-      </div>
+        <Masthead
+          status={feed.status}
+          eventsPerMin={eventsPerMin}
+          athenaReachable={feed.athenaReachable}
+        />
 
-      {/* Diagnostic strip — small, below the canvas */}
-      <Card>
-        <CardHeader>
-          <div className="flex items-center justify-between">
-            <CardTitle className="text-sm">Diagnostic — Phase 2 (static composition)</CardTitle>
-            <Badge variant="outline">v0.2.0</Badge>
+        {/* Cardiogram — the heartbeat trace */}
+        <div
+          style={{
+            height: 116,
+            background: theme.bgInset,
+            border: `1px solid ${theme.borderFaint}`,
+            borderRadius: 8,
+            overflow: 'hidden',
+            marginBottom: 18,
+          }}
+        >
+          <Cardiogram events={feed.events} serverTime={feed.serverTime} />
+        </div>
+
+        {/* Reading — dual human-readable interpretation */}
+        <div style={{ marginBottom: 20 }}>
+          <ZoneLabel>reading</ZoneLabel>
+          <Reading
+            interpretation={interpretation}
+            loading={interpLoading}
+            now={displayNow}
+          />
+        </div>
+
+        {/* Body: NOW (left) + STREAM (right) */}
+        <div
+          style={{
+            display: 'grid',
+            gridTemplateColumns: 'minmax(260px, 40%) 1fr',
+            gap: 28,
+            flex: 1,
+            minHeight: 360,
+          }}
+        >
+          {/* NOW column */}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 26 }}>
+            <div>
+              <ZoneLabel>now</ZoneLabel>
+              <CurrentFocus focus={feed.focus} now={displayNow} />
+            </div>
+            <div>
+              <ZoneLabel>vitals</ZoneLabel>
+              <Vitals vitals={feed.vitals} />
+            </div>
           </div>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-2 text-xs">
-          <div className="flex items-center gap-3">
-            <span className="text-muted-foreground">Athena WS:</span>
-            <StatusBadge status={status} />
-            <span className="text-muted-foreground ml-3">last update:</span>
-            <span className="font-mono">{formatAge(lastUpdateAt)}</span>
-            <span className="text-muted-foreground ml-3">plugin backend:</span>
-            <code className="font-mono">
-              {pluginHealth === null ? 'loading…' : JSON.stringify(pluginHealth)}
-            </code>
+
+          {/* STREAM column */}
+          <div
+            style={{
+              display: 'flex',
+              flexDirection: 'column',
+              minHeight: 0,
+              borderLeft: `1px solid ${theme.borderFaint}`,
+              paddingLeft: 26,
+            }}
+          >
+            <ZoneLabel>stream · {feed.events.length} events</ZoneLabel>
+            <div
+              className="forum-scroll"
+              style={{ overflowY: 'auto', maxHeight: 440, paddingRight: 8 }}
+            >
+              <EventStream events={feed.events} now={displayNow} />
+            </div>
           </div>
-          {state !== null && (
-            <details className="mt-1">
-              <summary className="text-muted-foreground cursor-pointer hover:text-foreground">
-                Athena state ({Object.keys(state).length} top-level keys, step {state.step ?? '—'})
-              </summary>
-              <pre className="mt-2 font-mono bg-background/40 p-3 rounded border border-border overflow-x-auto max-h-72">
-                {JSON.stringify(state, null, 2)}
-              </pre>
-            </details>
-          )}
-        </CardContent>
-      </Card>
+        </div>
+      </div>
     </div>
   );
 }
