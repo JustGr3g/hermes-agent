@@ -75,6 +75,9 @@ from agent.process_bootstrap import (
 from agent.iteration_budget import IterationBudget
 
 
+_OPENAI_CLS_CACHE: Optional[type] = None
+
+
 def _load_openai_cls() -> type:
     """Import and cache ``openai.OpenAI``."""
     global _OPENAI_CLS_CACHE
