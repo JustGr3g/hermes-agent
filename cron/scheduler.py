@@ -158,6 +158,19 @@ SILENT_MARKER = "[SILENT]"
 _hermes_home: Path | None = None
 
 
+def _format_process_steps(steps: list) -> str:
+    """Format ProcessStepResult entries into a compact markdown list."""
+    if not steps:
+        return "- (no steps recorded)"
+    lines = []
+    for s in steps:
+        icon = "✅" if s.status in ("ok", "passed") else "⚠️" if s.status == "failed" else "⏭️"
+        lines.append(f"- {icon} **{s.name}** — {s.status} in {s.duration_ms}ms")
+        if s.summary:
+            lines.append(f"  _({s.summary})_")
+    return "\n".join(lines)
+
+
 def _get_hermes_home() -> Path:
     """Resolve Hermes home dynamically while preserving test monkeypatch hooks."""
     return _hermes_home or get_hermes_home()
@@ -1389,6 +1402,64 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if prompt is None:
         logger.info("Job '%s': script produced no output, skipping AI call.", job_name)
         return True, "", SILENT_MARKER, None
+
+    # ---------------------------------------------------------------
+    # Process-as-code path — deterministic workflow definition
+    # ---------------------------------------------------------------
+    # If the job declares a `process` field, run the process instead of
+    # constructing a full AIAgent. The process handles facts gathering,
+    # generation, and verification internally with explicit code steps.
+    _process_name = (job.get("process") or "").strip()
+    if _process_name:
+        logger.info("Job '%s': running process '%s'", job_name, _process_name)
+        try:
+            from processes.registry import process_registry
+            import processes.daily_summary  # noqa: F401 — trigger registration
+
+            # Build process inputs from the job config
+            _process_inputs = {
+                "prompt": prompt,
+                "facts_script": (job.get("script") or "daily_summary_facts.py"),
+                "verify_script": (job.get("verify_script") or "verify_summary_numbers.py"),
+                "max_verify_retries": int(job.get("max_verify_retries") or 2),
+            }
+
+            # Run the process
+            _process_result = process_registry.run(_process_name, _process_inputs)
+
+            if _process_result.status == "failed":
+                logger.error("Job '%s': process '%s' failed: %s",
+                             job_name, _process_name, _process_result.error)
+                raise RuntimeError(_process_result.error)
+
+            final_response = _process_result.output or ""
+            if not final_response:
+                return True, "", SILENT_MARKER, None
+
+            logged_response = final_response if final_response else "(No response generated)"
+            output = f"""# Cron Job: {job_name}
+
+**Job ID:** {job_id}
+**Run Time:** {_hermes_now().strftime('%Y-%m-%d %H:%M:%S')}
+**Process:** {_process_name}
+**Schedule:** {job.get('schedule_display', 'N/A')}
+
+## Steps
+{_format_process_steps(_process_result.steps)}
+
+## Response
+
+{logged_response}
+"""
+
+            logger.info("Job '%s' process completed: status=%s", job_name, _process_result.status)
+            return True, output, final_response, None
+
+        except Exception as pe:
+            error_msg = f"{type(pe).__name__}: {str(pe)}"
+            logger.exception("Job '%s': process '%s' failed", job_name, _process_name)
+            return False, "", "", error_msg
+
     origin = _resolve_origin(job)
     _cron_session_id = f"cron_{job_id}_{_hermes_now().strftime('%Y%m%d_%H%M%S')}"
 
@@ -1791,6 +1862,67 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
         # Strip leaked placeholder text that upstream may inject on empty completions.
         if final_response.strip() == "(No response generated)":
             final_response = ""
+
+        # ---------------------------------------------------------------
+        # Verify → Remediate loop (Babysitter-inspired quality gate)
+        # ---------------------------------------------------------------
+        # If the job declares a verify_script, run it against the LLM output.
+        # If it flags discrepancies, feed them back to the agent for correction
+        # (up to max_verify_retries attempts). Only append the warning footer
+        # if all retries are exhausted and issues remain.
+        _verify_script = (job.get("verify_script") or "").strip()
+        _max_retries = int(job.get("max_verify_retries") or 2)
+        if _verify_script and final_response:
+            for _v_attempt in range(1 + _max_retries):
+                _vok, _vout = _run_job_script(
+                    _verify_script, stdin_text=final_response
+                )
+                # Verifier passed: empty stdout (no issues found)
+                if _vok and not _vout.strip():
+                    if _v_attempt > 0:
+                        logger.info(
+                            "Job '%s': verify passed on retry %s",
+                            job_name, _v_attempt,
+                        )
+                    break
+
+                # Verifier found issues — retry if we have attempts left
+                if _v_attempt < _max_retries:
+                    logger.info(
+                        "Job '%s': verify found issues (attempt %s/%s) — remediating",
+                        job_name, _v_attempt + 1, _max_retries + 1,
+                    )
+                    if hasattr(agent, "run_conversation") and callable(agent.run_conversation):
+                        _remediation_prompt = (
+                            "The post-generation verifier found discrepancies in the "
+                            "output below. Correct ALL of the following issues, then "
+                            "re-generate the full deliverable with the fixes applied.\n\n"
+                            "---\n"
+                            f"## Verifier output\n{_vout}\n\n"
+                            "---\n"
+                            f"## Original prompt\n{prompt}\n\n"
+                            "---\n"
+                            f"## Faulty output to fix\n{final_response}"
+                        )
+                        _remediation_result = agent.run_conversation(_remediation_prompt)
+                        if isinstance(_remediation_result, dict):
+                            _remediated = (_remediation_result.get("final_response") or "").strip()
+                            if _remediated:
+                                final_response = _remediated
+                            else:
+                                logger.warning(
+                                    "Job '%s': remediation returned empty response — "
+                                    "keeping original for re-verify",
+                                    job_name,
+                                )
+                else:
+                    # All retries exhausted — append verifier output as warning footer.
+                    logger.warning(
+                        "Job '%s': verify failed after %s attempts — appending warning",
+                        job_name, _max_retries + 1,
+                    )
+                    final_response = f"{final_response}\n\n{_vout}"
+
         # Use a separate variable for log display; keep final_response clean
         # for delivery logic (empty response = no delivery).
         logged_response = final_response if final_response else "(No response generated)"
@@ -1960,32 +2092,10 @@ def tick(verbose: bool = True, adapters=None, loop=None) -> int:
                 if verbose:
                     logger.info("Output saved to: %s", output_file)
 
-                # Optional post-LLM verifier: if the job declares a
-                # `verify_script`, run it with final_response on stdin and
-                # append any non-empty stdout to the deliverable. Used by
-                # the daily-summary job to fact-check numeric claims
-                # against the ground-truth facts sidecar before the
-                # message ships to the user. Failures here are non-fatal —
-                # we still deliver the original response.
-                _verify_script = (job.get("verify_script") or "").strip()
-                if success and _verify_script and final_response:
-                    try:
-                        _vok, _vout = _run_job_script(
-                            _verify_script, stdin_text=final_response
-                        )
-                        if _vok and _vout:
-                            final_response = f"{final_response}\n{_vout}"
-                        elif not _vok:
-                            logger.warning(
-                                "verify_script for job %s failed: %s",
-                                job["id"], _vout,
-                            )
-                    except Exception as ve:
-                        logger.warning(
-                            "verify_script for job %s raised: %s",
-                            job["id"], ve,
-                        )
-
+                # Verify → Remediate is now handled inside _run_job_impl
+                # (the verify_script + max_verify_retries loop runs right after
+                # the agent produces final_response). The _process_job level
+                # just receives the (possibly remediated) output.
                 # Deliver the final response to the origin/target chat.
                 # If the agent responded with [SILENT], skip delivery (but
                 # output is already saved above).  Failed jobs always deliver.

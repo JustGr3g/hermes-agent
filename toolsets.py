@@ -54,6 +54,10 @@ _HERMES_CORE_TOOLS = [
     "clarify",
     # Code execution + delegation
     "execute_code", "delegate_task",
+    # Verification and auto-remediation
+    "verify_and_remediate",
+    # Deterministic process execution
+    "run_process",
     # Cronjob management
     "cronjob",
     # Cross-platform messaging (gated on gateway running via check_fn)

@@ -1,0 +1,7 @@
+name: content-compression
+version: "1.0.0"
+description: "Content-type-aware compression plugin. 4 layers: shell output (command-compressor truncates long results), file content (density-filter keeps high-info lines), search results (match-summarizer collapses similar matches), agent context blocks (sentence-extractor extracts key-value pairs). Each layer independently togglable via env var. Targets ~50% token reduction on tool output without losing factual content."
+author: "Athena"
+hooks:
+  - transform_terminal_output
+  - transform_tool_result

@@ -10,7 +10,9 @@
       "provider": null,
       "base_url": null,
       "script": "daily_summary_facts.py",
+      "process": "daily_summary",
       "verify_script": "verify_summary_numbers.py",
+      "max_verify_retries": 2,
       "context_from": null,
       "schedule": {
         "kind": "cron",
