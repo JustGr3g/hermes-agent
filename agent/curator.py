@@ -390,7 +390,26 @@ CURATOR_REVIEW_PROMPT = (
     "(verification scripts, fixture generators, probes)\n"
     "      Then archive the old sibling. Use `terminal` with `mkdir -p "
     "~/.hermes/skills/<umbrella>/references/ && mv ... <umbrella>/"
-    "references/<topic>.md` (or templates/ / scripts/).\n"
+    "references/<topic>.md` (or templates/ / scripts/).\n\n"
+    "Package integrity — not optional:\n"
+    "Before demoting or archiving a skill, inspect it as a COMPLETE "
+    "directory package, not just SKILL.md. A skill root may include "
+    "`references/`, `templates/`, `scripts/`, and `assets/`; `skill_view` "
+    "discovers those relative to the skill root. A reference markdown file "
+    "inside another skill is NOT a new skill root and does not get its own "
+    "linked-file discovery.\n"
+    "If the source skill has support files OR SKILL.md contains relative "
+    "links such as `references/...`, `templates/...`, `scripts/...`, or "
+    "`assets/...`, DO NOT flatten only SKILL.md into "
+    "`<umbrella>/references/<old>.md`. Choose one safe path instead:\n"
+    "   • keep it as a standalone skill, OR\n"
+    "   • fully merge it by re-homing every needed support file into the "
+    "umbrella's canonical `references/`, `templates/`, `scripts/`, or "
+    "`assets/` directories AND rewrite the destination instructions to "
+    "the new paths, OR\n"
+    "   • archive the entire original skill package unchanged.\n"
+    "Never leave archived/demoted instructions pointing at files that were "
+    "left behind under the old skill directory.\n"
     "4. Also flag skills whose NAME is too narrow (contains a PR number, "
     "a feature codename, a specific error string, an 'audit' / "
     "'diagnosis' / 'salvage' session artifact). These almost always "
@@ -899,9 +918,12 @@ def _build_rename_summary(
           • flaky-thing — pruned (stale)
           • old-utility → spreadsheet-ops
         full report: hermes curator status
+        keep an umbrella stable: hermes curator pin document-tools
 
     Cap is 10 entries so a 50-skill consolidation doesn't blow up
-    agent.log; the full list is always in REPORT.md.
+    agent.log; the full list is always in REPORT.md. The pin hint only
+    appears when at least one consolidation produced an umbrella worth
+    pinning (pruned-only runs skip it).
     """
     after_by_name = {r.get("name"): r for r in after_report if isinstance(r, dict)}
     after_names = set(after_by_name.keys())
@@ -950,6 +972,17 @@ def _build_rename_summary(
     if total > SHOW:
         lines.append(f"  … and {total - SHOW} more")
     lines.append("full report: hermes curator status")
+    # Pin hint — only surface it when there's actually a destination skill
+    # worth pinning. The umbrella skills that absorbed content are the natural
+    # candidates: pinning one tells future curator runs to leave it alone.
+    # Pruned-only runs don't get this hint (nothing surviving to pin).
+    if consolidated:
+        umbrellas = sorted({e.get("into") for e in consolidated if e.get("into")})
+        if umbrellas:
+            example = umbrellas[0]
+            lines.append(
+                f"keep an umbrella stable: hermes curator pin {example}"
+            )
     return "\n".join(lines)
 
 

@@ -61,8 +61,18 @@ from pathlib import Path
 
 from hermes_constants import get_hermes_home
 
-
-_OPENAI_CLS_CACHE: Optional[type] = None
+# OpenAI lazy proxy + safe stdio + proxy URL helpers — see agent/process_bootstrap.py.
+# `OpenAI` is re-exported here so `patch("run_agent.OpenAI", ...)` in tests works.
+from agent.process_bootstrap import (
+    OpenAI,
+    _OpenAIProxy,
+    _load_openai_cls,
+    _SafeWriter,
+    _install_safe_stdio,
+    _get_proxy_from_env,
+    _get_proxy_for_base_url,
+)
+from agent.iteration_budget import IterationBudget
 
 
 def _load_openai_cls() -> type:
@@ -139,6 +149,7 @@ from agent.memory_manager import (
 )
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
+from agent.redact import redact_sensitive_text
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     PLATFORM_HINTS,
@@ -188,184 +199,57 @@ from agent.display import (
     _detect_tool_failure,
     get_tool_emoji as _get_tool_emoji,
 )
+from agent.tool_guardrails import (
+    ToolCallGuardrailConfig,
+    ToolCallGuardrailController,
+    ToolGuardrailDecision,
+    append_toolguard_guidance,
+    toolguard_synthetic_result,
+)
+from agent.tool_result_classification import (
+    FILE_MUTATING_TOOL_NAMES as _FILE_MUTATING_TOOLS,
+    file_mutation_result_landed,
+)
 from agent.trajectory import (
     convert_scratchpad_to_think,
     has_incomplete_scratchpad,
     save_trajectory as _save_trajectory_to_file,
 )
-from utils import (
-    atomic_json_write,
-    base_url_host_matches,
-    base_url_hostname,
-    env_var_enabled,
-    normalize_proxy_url,
+from agent.message_sanitization import (
+    _SURROGATE_RE,
+    _sanitize_surrogates,
+    _sanitize_structure_surrogates,
+    _sanitize_messages_surrogates,
+    _escape_invalid_chars_in_json_strings,
+    _repair_tool_call_arguments,
+    _strip_non_ascii,
+    _sanitize_messages_non_ascii,
+    _sanitize_tools_non_ascii,
+    _strip_images_from_messages,
+    _sanitize_structure_non_ascii,
 )
+from agent.tool_dispatch_helpers import (
+    _NEVER_PARALLEL_TOOLS,
+    _PARALLEL_SAFE_TOOLS,
+    _PATH_SCOPED_TOOLS,
+    _DESTRUCTIVE_PATTERNS,
+    _REDIRECT_OVERWRITE,
+    _is_destructive_command,
+    _should_parallelize_tool_batch,
+    _extract_parallel_scope_path,
+    _paths_overlap,
+    _is_multimodal_tool_result,
+    _multimodal_text_summary,
+    _append_subdir_hint_to_multimodal,
+    _extract_file_mutation_targets,
+    _extract_error_preview,
+    _trajectory_normalize_msg,
+)
+from utils import atomic_json_write, base_url_host_matches, base_url_hostname, env_var_enabled, normalize_proxy_url
 from hermes_cli.config import cfg_get
 
 
-class _SafeWriter:
-    """Transparent stdio wrapper that catches OSError/ValueError from broken pipes.
 
-    When hermes-agent runs as a systemd service, Docker container, or headless
-    daemon, the stdout/stderr pipe can become unavailable (idle timeout, buffer
-    exhaustion, socket reset). Any print() call then raises
-    ``OSError: [Errno 5] Input/output error``, which can crash agent setup or
-    run_conversation() — especially via double-fault when an except handler
-    also tries to print.
-
-    Additionally, when subagents run in ThreadPoolExecutor threads, the shared
-    stdout handle can close between thread teardown and cleanup, raising
-    ``ValueError: I/O operation on closed file`` instead of OSError.
-
-    This wrapper delegates all writes to the underlying stream and silently
-    catches both OSError and ValueError. It is transparent when the wrapped
-    stream is healthy.
-    """
-
-    __slots__ = ("_inner",)
-
-    def __init__(self, inner):
-        object.__setattr__(self, "_inner", inner)
-
-    def write(self, data):
-        try:
-            return self._inner.write(data)
-        except (OSError, ValueError):
-            return len(data) if isinstance(data, str) else 0
-
-    def flush(self):
-        try:
-            self._inner.flush()
-        except (OSError, ValueError):
-            pass
-
-    def fileno(self):
-        return self._inner.fileno()
-
-    def isatty(self):
-        try:
-            return self._inner.isatty()
-        except (OSError, ValueError):
-            return False
-
-    def __getattr__(self, name):
-        return getattr(self._inner, name)
-
-
-def _get_proxy_from_env() -> Optional[str]:
-    """Read proxy URL from environment variables.
-
-    Checks HTTPS_PROXY, HTTP_PROXY, ALL_PROXY (and lowercase variants) in order.
-    Returns the first valid proxy URL found, or None if no proxy is configured.
-    """
-    for key in (
-        "HTTPS_PROXY",
-        "HTTP_PROXY",
-        "ALL_PROXY",
-        "https_proxy",
-        "http_proxy",
-        "all_proxy",
-    ):
-        value = os.environ.get(key, "").strip()
-        if value:
-            return normalize_proxy_url(value)
-    return None
-
-
-def _get_proxy_for_base_url(base_url: Optional[str]) -> Optional[str]:
-    """Return an env-configured proxy unless NO_PROXY excludes this base URL."""
-    proxy = _get_proxy_from_env()
-    if not proxy or not base_url:
-        return proxy
-
-    host = base_url_hostname(base_url)
-    if not host:
-        return proxy
-
-    try:
-        if urllib.request.proxy_bypass_environment(host):
-            return None
-    except Exception:
-        pass
-
-    return proxy
-
-
-def _install_safe_stdio() -> None:
-    """Wrap stdout/stderr so best-effort console output cannot crash the agent."""
-    for stream_name in ("stdout", "stderr"):
-        stream = getattr(sys, stream_name, None)
-        if stream is not None and not isinstance(stream, _SafeWriter):
-            setattr(sys, stream_name, _SafeWriter(stream))
-
-
-class IterationBudget:
-    """Thread-safe iteration counter for an agent.
-
-    Each agent (parent or subagent) gets its own ``IterationBudget``.
-    The parent's budget is capped at ``max_iterations`` (default 90).
-    Each subagent gets an independent budget capped at
-    ``delegation.max_iterations`` (default 50) — this means total
-    iterations across parent + subagents can exceed the parent's cap.
-    Users control the per-subagent limit via ``delegation.max_iterations``
-    in config.yaml.
-
-    ``execute_code`` (programmatic tool calling) iterations are refunded via
-    :meth:`refund` so they don't eat into the budget.
-    """
-
-    def __init__(self, max_total: int):
-        self.max_total = max_total
-        self._used = 0
-        self._lock = threading.Lock()
-
-    def consume(self) -> bool:
-        """Try to consume one iteration.  Returns True if allowed."""
-        with self._lock:
-            if self._used >= self.max_total:
-                return False
-            self._used += 1
-            return True
-
-    def refund(self) -> None:
-        """Give back one iteration (e.g. for execute_code turns)."""
-        with self._lock:
-            if self._used > 0:
-                self._used -= 1
-
-    @property
-    def used(self) -> int:
-        return self._used
-
-    @property
-    def remaining(self) -> int:
-        with self._lock:
-            return max(0, self.max_total - self._used)
-
-
-# Tools that must never run concurrently (interactive / user-facing).
-# When any of these appear in a batch, we fall back to sequential execution.
-_NEVER_PARALLEL_TOOLS = frozenset({"clarify"})
-
-# Read-only tools with no shared mutable session state.
-_PARALLEL_SAFE_TOOLS = frozenset({
-    "ha_get_state",
-    "ha_list_entities",
-    "ha_list_services",
-    "read_file",
-    "search_files",
-    "session_search",
-    "skill_view",
-    "skills_list",
-    "vision_analyze",
-    "web_extract",
-    "web_search",
-})
-
-# File tools can run concurrently when they target independent paths.
-_PATH_SCOPED_TOOLS = frozenset({"read_file", "write_file", "patch"})
-
-# Maximum number of concurrent worker threads for parallel tool execution.
 _MAX_TOOL_WORKERS = 8
 
 # Guard so the OpenRouter metadata pre-warm thread is only spawned once per
@@ -373,474 +257,6 @@ _MAX_TOOL_WORKERS = 8
 # gateway processes leak one OS thread per incoming message and eventually
 # exhaust the system thread limit (RuntimeError: can't start new thread).
 _openrouter_prewarm_done = threading.Event()
-
-# Patterns that indicate a terminal command may modify/delete files.
-_DESTRUCTIVE_PATTERNS = re.compile(
-    r"""(?:^|\s|&&|\|\||;|`)(?:
-        rm\s|rmdir\s|
-        cp\s|install\s|
-        mv\s|
-        sed\s+-i|
-        truncate\s|
-        dd\s|
-        shred\s|
-        git\s+(?:reset|clean|checkout)\s
-    )""",
-    re.VERBOSE,
-)
-# Output redirects that overwrite files (> but not >>)
-_REDIRECT_OVERWRITE = re.compile(r"[^>]>[^>]|^>[^>]")
-
-
-def _is_destructive_command(cmd: str) -> bool:
-    """Heuristic: does this terminal command look like it modifies/deletes files?"""
-    if not cmd:
-        return False
-    if _DESTRUCTIVE_PATTERNS.search(cmd):
-        return True
-    if _REDIRECT_OVERWRITE.search(cmd):
-        return True
-    return False
-
-
-def _should_parallelize_tool_batch(tool_calls) -> bool:
-    """Return True when a tool-call batch is safe to run concurrently."""
-    if len(tool_calls) <= 1:
-        return False
-
-    tool_names = [tc.function.name for tc in tool_calls]
-    if any(name in _NEVER_PARALLEL_TOOLS for name in tool_names):
-        return False
-
-    reserved_paths: list[Path] = []
-    for tool_call in tool_calls:
-        tool_name = tool_call.function.name
-        try:
-            function_args = json.loads(tool_call.function.arguments)
-        except Exception:
-            logging.debug(
-                "Could not parse args for %s — defaulting to sequential; raw=%s",
-                tool_name,
-                tool_call.function.arguments[:200],
-            )
-            return False
-        if not isinstance(function_args, dict):
-            logging.debug(
-                "Non-dict args for %s (%s) — defaulting to sequential",
-                tool_name,
-                type(function_args).__name__,
-            )
-            return False
-
-        if tool_name in _PATH_SCOPED_TOOLS:
-            scoped_path = _extract_parallel_scope_path(tool_name, function_args)
-            if scoped_path is None:
-                return False
-            if any(
-                _paths_overlap(scoped_path, existing) for existing in reserved_paths
-            ):
-                return False
-            reserved_paths.append(scoped_path)
-            continue
-
-        if tool_name not in _PARALLEL_SAFE_TOOLS:
-            return False
-
-    return True
-
-
-def _extract_parallel_scope_path(tool_name: str, function_args: dict) -> Path | None:
-    """Return the normalized file target for path-scoped tools."""
-    if tool_name not in _PATH_SCOPED_TOOLS:
-        return None
-
-    raw_path = function_args.get("path")
-    if not isinstance(raw_path, str) or not raw_path.strip():
-        return None
-
-    expanded = Path(raw_path).expanduser()
-    if expanded.is_absolute():
-        return Path(os.path.abspath(str(expanded)))
-
-    # Avoid resolve(); the file may not exist yet.
-    return Path(os.path.abspath(str(Path.cwd() / expanded)))
-
-
-def _paths_overlap(left: Path, right: Path) -> bool:
-    """Return True when two paths may refer to the same subtree."""
-    left_parts = left.parts
-    right_parts = right.parts
-    if not left_parts or not right_parts:
-        # Empty paths shouldn't reach here (guarded upstream), but be safe.
-        return bool(left_parts) == bool(right_parts) and bool(left_parts)
-    common_len = min(len(left_parts), len(right_parts))
-    return left_parts[:common_len] == right_parts[:common_len]
-
-
-_SURROGATE_RE = re.compile(r"[\ud800-\udfff]")
-
-
-def _sanitize_surrogates(text: str) -> str:
-    """Replace lone surrogate code points with U+FFFD (replacement character).
-
-    Surrogates are invalid in UTF-8 and will crash ``json.dumps()`` inside the
-    OpenAI SDK.  This is a fast no-op when the text contains no surrogates.
-    """
-    if _SURROGATE_RE.search(text):
-        return _SURROGATE_RE.sub("\ufffd", text)
-    return text
-
-
-# _summarize_user_message_for_log is imported from agent.codex_responses_adapter
-# (see import block above). Remains importable from run_agent for backward compat.
-
-
-def _sanitize_structure_surrogates(payload: Any) -> bool:
-    """Replace surrogate code points in nested dict/list payloads in-place.
-
-    Mirror of ``_sanitize_structure_non_ascii`` but for surrogate recovery.
-    Used to scrub nested structured fields (e.g. ``reasoning_details`` — an
-    array of dicts with ``summary``/``text`` strings) that flat per-field
-    checks don't reach.  Returns True if any surrogates were replaced.
-    """
-    found = False
-
-    def _walk(node):
-        nonlocal found
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if isinstance(value, str):
-                    if _SURROGATE_RE.search(value):
-                        node[key] = _SURROGATE_RE.sub("\ufffd", value)
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-        elif isinstance(node, list):
-            for idx, value in enumerate(node):
-                if isinstance(value, str):
-                    if _SURROGATE_RE.search(value):
-                        node[idx] = _SURROGATE_RE.sub("\ufffd", value)
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-
-    _walk(payload)
-    return found
-
-
-def _sanitize_messages_surrogates(messages: list) -> bool:
-    """Sanitize surrogate characters from all string content in a messages list.
-
-    Walks message dicts in-place. Returns True if any surrogates were found
-    and replaced, False otherwise. Covers content/text, name, tool call
-    metadata/arguments, AND any additional string or nested structured fields
-    (``reasoning``, ``reasoning_content``, ``reasoning_details``, etc.) so
-    retries don't fail on a non-content field.  Byte-level reasoning models
-    (xiaomi/mimo, kimi, glm) can emit lone surrogates in reasoning output
-    that flow through to ``api_messages["reasoning_content"]`` on the next
-    turn and crash json.dumps inside the OpenAI SDK.
-    """
-    found = False
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        content = msg.get("content")
-        if isinstance(content, str) and _SURROGATE_RE.search(content):
-            msg["content"] = _SURROGATE_RE.sub("\ufffd", content)
-            found = True
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text")
-                    if isinstance(text, str) and _SURROGATE_RE.search(text):
-                        part["text"] = _SURROGATE_RE.sub("\ufffd", text)
-                        found = True
-        name = msg.get("name")
-        if isinstance(name, str) and _SURROGATE_RE.search(name):
-            msg["name"] = _SURROGATE_RE.sub("\ufffd", name)
-            found = True
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                if not isinstance(tc, dict):
-                    continue
-                tc_id = tc.get("id")
-                if isinstance(tc_id, str) and _SURROGATE_RE.search(tc_id):
-                    tc["id"] = _SURROGATE_RE.sub("\ufffd", tc_id)
-                    found = True
-                fn = tc.get("function")
-                if isinstance(fn, dict):
-                    fn_name = fn.get("name")
-                    if isinstance(fn_name, str) and _SURROGATE_RE.search(fn_name):
-                        fn["name"] = _SURROGATE_RE.sub("\ufffd", fn_name)
-                        found = True
-                    fn_args = fn.get("arguments")
-                    if isinstance(fn_args, str) and _SURROGATE_RE.search(fn_args):
-                        fn["arguments"] = _SURROGATE_RE.sub("\ufffd", fn_args)
-                        found = True
-        # Walk any additional string / nested fields (reasoning,
-        # reasoning_content, reasoning_details, etc.) — surrogates from
-        # byte-level reasoning models (xiaomi/mimo, kimi, glm) can lurk
-        # in these fields and aren't covered by the per-field checks above.
-        # Matches _sanitize_messages_non_ascii's coverage (PR #10537).
-        for key, value in msg.items():
-            if key in {"content", "name", "tool_calls", "role"}:
-                continue
-            if isinstance(value, str):
-                if _SURROGATE_RE.search(value):
-                    msg[key] = _SURROGATE_RE.sub("\ufffd", value)
-                    found = True
-            elif isinstance(value, (dict, list)):
-                if _sanitize_structure_surrogates(value):
-                    found = True
-    return found
-
-
-def _escape_invalid_chars_in_json_strings(raw: str) -> str:
-    """Escape unescaped control chars inside JSON string values.
-
-    Walks the raw JSON character-by-character, tracking whether we are
-    inside a double-quoted string. Inside strings, replaces literal
-    control characters (0x00-0x1F) that aren't already part of an escape
-    sequence with their ``\\uXXXX`` equivalents. Pass-through for everything
-    else.
-
-    Ported from #12093 — complements the other repair passes in
-    ``_repair_tool_call_arguments`` when ``json.loads(strict=False)`` is
-    not enough (e.g. llama.cpp backends that emit literal apostrophes or
-    tabs alongside other malformations).
-    """
-    out: list[str] = []
-    in_string = False
-    i = 0
-    n = len(raw)
-    while i < n:
-        ch = raw[i]
-        if in_string:
-            if ch == "\\" and i + 1 < n:
-                # Already-escaped char — pass through as-is
-                out.append(ch)
-                out.append(raw[i + 1])
-                i += 2
-                continue
-            if ch == '"':
-                in_string = False
-                out.append(ch)
-            elif ord(ch) < 0x20:
-                out.append(f"\\u{ord(ch):04x}")
-            else:
-                out.append(ch)
-        else:
-            if ch == '"':
-                in_string = True
-            out.append(ch)
-        i += 1
-    return "".join(out)
-
-
-def _repair_tool_call_arguments(raw_args: str, tool_name: str = "?") -> str:
-    """Attempt to repair malformed tool_call argument JSON.
-
-    Models like GLM-5.1 via Ollama can produce truncated JSON, trailing
-    commas, Python ``None``, etc.  The API proxy rejects these with HTTP 400
-    "invalid tool call arguments".  This function applies common repairs;
-    if all fail it returns ``"{}"`` so the request succeeds (better than
-    crashing the session).  All repairs are logged at WARNING level.
-    """
-    raw_stripped = raw_args.strip() if isinstance(raw_args, str) else ""
-
-    # Fast-path: empty / whitespace-only -> empty object
-    if not raw_stripped:
-        logger.warning("Sanitized empty tool_call arguments for %s", tool_name)
-        return "{}"
-
-    # Python-literal None -> normalise to {}
-    if raw_stripped == "None":
-        logger.warning("Sanitized Python-None tool_call arguments for %s", tool_name)
-        return "{}"
-
-    # Repair pass 0: llama.cpp backends sometimes emit literal control
-    # characters (tabs, newlines) inside JSON string values. json.loads
-    # with strict=False accepts these and lets us re-serialise the
-    # result into wire-valid JSON without any string surgery. This is
-    # the most common local-model repair case (#12068).
-    try:
-        parsed = json.loads(raw_stripped, strict=False)
-        reserialised = json.dumps(parsed, separators=(",", ":"))
-        if reserialised != raw_stripped:
-            logger.warning(
-                "Repaired unescaped control chars in tool_call arguments for %s",
-                tool_name,
-            )
-        return reserialised
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-    # Attempt common JSON repairs
-    fixed = raw_stripped
-    # 1. Strip trailing commas before } or ]
-    fixed = re.sub(r",\s*([}\]])", r"\1", fixed)
-    # 2. Close unclosed structures
-    open_curly = fixed.count("{") - fixed.count("}")
-    open_bracket = fixed.count("[") - fixed.count("]")
-    if open_curly > 0:
-        fixed += "}" * open_curly
-    if open_bracket > 0:
-        fixed += "]" * open_bracket
-    # 3. Remove excess closing braces/brackets (bounded to 50 iterations)
-    for _ in range(50):
-        try:
-            json.loads(fixed)
-            break
-        except json.JSONDecodeError:
-            if fixed.endswith("}") and fixed.count("}") > fixed.count("{"):
-                fixed = fixed[:-1]
-            elif fixed.endswith("]") and fixed.count("]") > fixed.count("["):
-                fixed = fixed[:-1]
-            else:
-                break
-
-    try:
-        json.loads(fixed)
-        logger.warning(
-            "Repaired malformed tool_call arguments for %s: %s → %s",
-            tool_name,
-            raw_stripped[:80],
-            fixed[:80],
-        )
-        return fixed
-    except json.JSONDecodeError:
-        pass
-
-    # Repair pass 4: escape unescaped control chars inside JSON strings,
-    # then retry. Catches cases where strict=False alone fails because
-    # other malformations are present too.
-    try:
-        escaped = _escape_invalid_chars_in_json_strings(fixed)
-        if escaped != fixed:
-            json.loads(escaped)
-            logger.warning(
-                "Repaired control-char-laced tool_call arguments for %s: %s → %s",
-                tool_name,
-                raw_stripped[:80],
-                escaped[:80],
-            )
-            return escaped
-    except (json.JSONDecodeError, TypeError, ValueError):
-        pass
-
-    # Last resort: replace with empty object so the API request doesn't
-    # crash the entire session.
-    logger.warning(
-        "Unrepairable tool_call arguments for %s — "
-        "replaced with empty object (was: %s)",
-        tool_name,
-        raw_stripped[:80],
-    )
-    return "{}"
-
-
-def _strip_non_ascii(text: str) -> str:
-    """Remove non-ASCII characters, replacing with closest ASCII equivalent or removing.
-
-    Used as a last resort when the system encoding is ASCII and can't handle
-    any non-ASCII characters (e.g. LANG=C on Chromebooks).
-    """
-    return text.encode("ascii", errors="ignore").decode("ascii")
-
-
-def _sanitize_messages_non_ascii(messages: list) -> bool:
-    """Strip non-ASCII characters from all string content in a messages list.
-
-    This is a last-resort recovery for systems with ASCII-only encoding
-    (LANG=C, Chromebooks, minimal containers).  Returns True if any
-    non-ASCII content was found and sanitized.
-    """
-    found = False
-    for msg in messages:
-        if not isinstance(msg, dict):
-            continue
-        # Sanitize content (string)
-        content = msg.get("content")
-        if isinstance(content, str):
-            sanitized = _strip_non_ascii(content)
-            if sanitized != content:
-                msg["content"] = sanitized
-                found = True
-        elif isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict):
-                    text = part.get("text")
-                    if isinstance(text, str):
-                        sanitized = _strip_non_ascii(text)
-                        if sanitized != text:
-                            part["text"] = sanitized
-                            found = True
-        # Sanitize name field (can contain non-ASCII in tool results)
-        name = msg.get("name")
-        if isinstance(name, str):
-            sanitized = _strip_non_ascii(name)
-            if sanitized != name:
-                msg["name"] = sanitized
-                found = True
-        # Sanitize tool_calls
-        tool_calls = msg.get("tool_calls")
-        if isinstance(tool_calls, list):
-            for tc in tool_calls:
-                if isinstance(tc, dict):
-                    fn = tc.get("function", {})
-                    if isinstance(fn, dict):
-                        fn_args = fn.get("arguments")
-                        if isinstance(fn_args, str):
-                            sanitized = _strip_non_ascii(fn_args)
-                            if sanitized != fn_args:
-                                fn["arguments"] = sanitized
-                                found = True
-        # Sanitize any additional top-level string fields (e.g. reasoning_content)
-        for key, value in msg.items():
-            if key in {"content", "name", "tool_calls", "role"}:
-                continue
-            if isinstance(value, str):
-                sanitized = _strip_non_ascii(value)
-                if sanitized != value:
-                    msg[key] = sanitized
-                    found = True
-    return found
-
-
-def _sanitize_tools_non_ascii(tools: list) -> bool:
-    """Strip non-ASCII characters from tool payloads in-place."""
-    return _sanitize_structure_non_ascii(tools)
-
-
-def _sanitize_structure_non_ascii(payload: Any) -> bool:
-    """Strip non-ASCII characters from nested dict/list payloads in-place."""
-    found = False
-
-    def _walk(node):
-        nonlocal found
-        if isinstance(node, dict):
-            for key, value in node.items():
-                if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
-                    if sanitized != value:
-                        node[key] = sanitized
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-        elif isinstance(node, list):
-            for idx, value in enumerate(node):
-                if isinstance(value, str):
-                    sanitized = _strip_non_ascii(value)
-                    if sanitized != value:
-                        node[idx] = sanitized
-                        found = True
-                elif isinstance(value, (dict, list)):
-                    _walk(value)
-
-    _walk(payload)
-    return found
-
 
 # =========================================================================
 # Large tool result handler — save oversized output to temp file
@@ -900,6 +316,45 @@ def _qwen_portal_headers() -> dict:
         "X-DashScope-UserAgent": _ua,
         "X-DashScope-AuthType": "qwen-oauth",
     }
+
+
+class _StreamErrorEvent(Exception):
+    """Synthesized provider error surfaced from a Responses ``error`` SSE frame.
+
+    Some Codex-style Responses backends (xAI for subscription/quota
+    failures, custom relays under malformed-tool-call conditions) emit a
+    standalone ``type=error`` frame instead of routing the failure
+    through ``response.failed`` or returning an HTTP 4xx.  The fallback
+    streaming path raises this exception so ``_summarize_api_error`` and
+    ``_extract_api_error_context`` see a familiar ``.body`` /
+    ``.status_code`` shape and the entitlement detector can match the
+    underlying provider message ("do not have an active Grok
+    subscription", etc.).
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        code: Optional[str] = None,
+        param: Optional[str] = None,
+        status_code: Optional[int] = None,
+    ) -> None:
+        super().__init__(message)
+        self.message = message
+        self.code = code
+        self.param = param
+        self.status_code = status_code
+        # OpenAI SDK-shaped body so _extract_api_error_context /
+        # _summarize_api_error / classify_api_error all pick it up.
+        self.body: Dict[str, Any] = {
+            "error": {
+                "message": message,
+                "code": code,
+                "param": param,
+                "type": "error",
+            }
+        }
 
 
 class AIAgent:
@@ -972,6 +427,7 @@ class AIAgent:
         prefill_messages: List[Dict[str, Any]] = None,
         platform: str = None,
         user_id: str = None,
+        user_id_alt: str = None,
         user_name: str = None,
         chat_id: str = None,
         chat_name: str = None,
@@ -2468,7 +1924,122 @@ class AIAgent:
                 "is_anthropic_oauth": self._is_anthropic_oauth,
             })
 
-    def reset_session_state(self):
+    def _get_session_db_for_recall(self):
+        """Return a SessionDB for recall, lazily creating it if an entrypoint forgot.
+
+        Most frontends pass ``session_db`` into ``AIAgent`` explicitly, but recall
+        is important enough that a missing constructor argument should degrade by
+        opening the default state DB instead of making the advertised
+        ``session_search`` tool unusable.
+        """
+        if self._session_db is not None:
+            return self._session_db
+        try:
+            from hermes_state import SessionDB
+
+            self._session_db = SessionDB()
+            return self._session_db
+        except Exception as exc:
+            logger.debug("SessionDB unavailable for recall", exc_info=True)
+            return None
+
+    def _ensure_db_session(self) -> None:
+        """Create session DB row on first use. Disables _session_db on failure."""
+        if self._session_db_created or not self._session_db:
+            return
+        try:
+            self._session_db.create_session(
+                session_id=self.session_id,
+                source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                model=self.model,
+                model_config=self._session_init_model_config,
+                system_prompt=self._cached_system_prompt,
+                user_id=None,
+                parent_session_id=self._parent_session_id,
+            )
+            self._session_db_created = True
+        except Exception as e:
+            # Transient failure (e.g. SQLite lock). Keep _session_db alive —
+            # _session_db_created stays False so next run_conversation() retries.
+            logger.warning(
+                "Session DB creation failed (will retry next turn): %s", e
+            )
+
+    def _transition_context_engine_session(
+        self,
+        *,
+        old_session_id: Optional[str] = None,
+        new_session_id: Optional[str] = None,
+        previous_messages: Optional[list] = None,
+        carry_over_context: bool = False,
+        reset_engine: bool = True,
+        **extra_context,
+    ) -> None:
+        """Notify the active context engine about a host session transition.
+
+        Generic host-side lifecycle helper. The built-in compressor keeps its
+        existing reset behavior; plugin engines that implement richer hooks
+        (``on_session_end``, ``on_session_reset``, ``on_session_start``,
+        ``carry_over_new_session_context``) can flush old-session state,
+        reset runtime counters, bind to the new session, and optionally
+        carry retained context forward.
+        """
+        engine = getattr(self, "context_compressor", None)
+        if not engine:
+            return
+
+        if old_session_id and previous_messages is not None and hasattr(engine, "on_session_end"):
+            try:
+                engine.on_session_end(old_session_id, previous_messages)
+            except Exception as exc:
+                logger.debug("context engine on_session_end during transition: %s", exc)
+
+        if reset_engine and hasattr(engine, "on_session_reset"):
+            try:
+                engine.on_session_reset()
+            except Exception as exc:
+                logger.debug("context engine on_session_reset during transition: %s", exc)
+
+        should_start = bool(
+            old_session_id
+            or previous_messages is not None
+            or carry_over_context
+            or extra_context
+        )
+        target_session_id = new_session_id or getattr(self, "session_id", "") or ""
+        if should_start and target_session_id and hasattr(engine, "on_session_start"):
+            start_context = {
+                "old_session_id": old_session_id,
+                "carry_over_context": carry_over_context,
+                "platform": getattr(self, "platform", None) or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
+                "model": getattr(self, "model", ""),
+                "context_length": getattr(engine, "context_length", None),
+                "conversation_id": getattr(self, "_gateway_session_key", None),
+            }
+            start_context.update(extra_context)
+            start_context = {k: v for k, v in start_context.items() if v not in (None, "")}
+            try:
+                engine.on_session_start(target_session_id, **start_context)
+            except Exception as exc:
+                logger.debug("context engine on_session_start during transition: %s", exc)
+
+        if (
+            carry_over_context
+            and old_session_id
+            and target_session_id
+            and hasattr(engine, "carry_over_new_session_context")
+        ):
+            try:
+                engine.carry_over_new_session_context(old_session_id, target_session_id)
+            except Exception as exc:
+                logger.debug("context engine carry_over_new_session_context during transition: %s", exc)
+
+    def reset_session_state(
+        self,
+        previous_messages: Optional[list] = None,
+        old_session_id: Optional[str] = None,
+        carry_over_context: bool = False,
+    ):
         """Reset all session-scoped token counters to 0 for a fresh session.
 
         This method encapsulates the reset logic for all session-level metrics
@@ -2485,6 +2056,12 @@ class AIAgent:
 
         This keeps the counter reset logic DRY and maintainable in one place
         rather than scattering it across multiple methods.
+
+        When ``previous_messages`` / ``old_session_id`` / ``carry_over_context``
+        are provided, the active context engine is notified through the
+        full transition lifecycle (``_transition_context_engine_session``)
+        instead of a bare reset. Default callers pass nothing and keep the
+        existing reset-only behavior.
         """
         # Token usage counters
         self.session_total_tokens = 0
@@ -2503,9 +2080,14 @@ class AIAgent:
         # Turn counter (added after reset_session_state was first written — #2635)
         self._user_turn_count = 0
 
-        # Context engine reset (works for both built-in compressor and plugins)
-        if hasattr(self, "context_compressor") and self.context_compressor:
-            self.context_compressor.on_session_reset()
+        # Context engine reset/transition (works for built-in compressor and plugins)
+        self._transition_context_engine_session(
+            old_session_id=old_session_id,
+            new_session_id=getattr(self, "session_id", None),
+            previous_messages=previous_messages,
+            carry_over_context=carry_over_context,
+            reset_engine=True,
+        )
 
     def _ensure_lmstudio_runtime_loaded(
         self, config_context_length: Optional[int] = None
@@ -2876,6 +2458,190 @@ class AIAgent:
             except Exception:
                 logger.debug("status_callback error in _emit_warning", exc_info=True)
 
+    # ── Buffered retry/fallback status ────────────────────────────────────
+    # Retry and fallback chains were flooding the CLI/gateway with status
+    # noise that users found confusing: a single transient 429 could produce
+    # 10+ "Provider/Endpoint/Retrying in 5s..." lines before the request
+    # eventually succeeded.  The buffered helpers below capture these
+    # status messages instead of emitting them immediately.  They are
+    # flushed (shown to the user) ONLY when every retry and fallback has
+    # been exhausted; on success they are silently dropped.  Backend logs
+    # (agent.log) are unaffected — every individual emission site still
+    # writes to ``logger.warning`` / ``logger.info`` for diagnosis.
+
+    def _buffer_status(self, message: str) -> None:
+        """Buffer a retry/fallback status message.
+
+        Stored as a (kind, text) tuple where ``kind`` is one of:
+        - ``"status"``  -> replays via ``_emit_status``
+        - ``"vprint"``  -> replays via ``_vprint(force=True)``
+        - ``"warn"``    -> replays via ``_emit_warning``
+        Used to defer noisy retry chatter until we know whether the
+        turn ultimately recovered or failed.
+        """
+        try:
+            buf = getattr(self, "_retry_status_buffer", None)
+            if buf is None:
+                buf = []
+                self._retry_status_buffer = buf
+            buf.append(("status", message))
+        except Exception:
+            # Never break the retry loop on a buffer hiccup.
+            pass
+
+    def _buffer_vprint(self, message: str) -> None:
+        """Buffer a vprint(force=True) retry/fallback line."""
+        try:
+            buf = getattr(self, "_retry_status_buffer", None)
+            if buf is None:
+                buf = []
+                self._retry_status_buffer = buf
+            buf.append(("vprint", message))
+        except Exception:
+            pass
+
+    def _clear_status_buffer(self) -> None:
+        """Drop buffered retry messages — call on successful recovery."""
+        try:
+            buf = getattr(self, "_retry_status_buffer", None)
+            if buf:
+                buf.clear()
+        except Exception:
+            pass
+
+    def _flush_status_buffer(self) -> None:
+        """Emit buffered retry messages — call on terminal failure.
+
+        Surfaces the full retry/fallback trace so the user can see what
+        was tried before the turn gave up.
+        """
+        try:
+            buf = getattr(self, "_retry_status_buffer", None)
+            if not buf:
+                return
+            # Drain first so a callback exception doesn't double-emit.
+            messages = list(buf)
+            buf.clear()
+            for kind, msg in messages:
+                try:
+                    if kind == "status":
+                        self._emit_status(msg)
+                    elif kind == "warn":
+                        self._emit_warning(msg)
+                    else:
+                        self._vprint(f"{self.log_prefix}{msg}", force=True)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def _disable_codex_reasoning_replay(
+        self,
+        messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, int]:
+        """Disable Responses encrypted reasoning replay and strip cached state.
+
+        Called from the conversation_loop retry path when the provider
+        rejects a replayed ``codex_reasoning_items`` blob with HTTP 400
+        ``invalid_encrypted_content``.  Sets ``self._codex_reasoning_replay_enabled``
+        to ``False`` (consumed by ``codex_responses_adapter._chat_messages_to_responses_input``
+        and ``transports/codex.py`` to drop ``reasoning.encrypted_content``
+        from subsequent requests) and pops ``codex_reasoning_items`` from
+        every assistant message in ``messages`` so they cannot be replayed
+        again later in the session.
+
+        Returns a small stats dict ``{"messages": int, "items": int}``
+        counting what was stripped — purely for diagnostic logging.
+        """
+        stripped_messages = 0
+        stripped_items = 0
+        target_messages = messages if isinstance(messages, list) else []
+
+        for msg in target_messages:
+            if not isinstance(msg, dict) or msg.get("role") != "assistant":
+                continue
+            items = msg.pop("codex_reasoning_items", None)
+            if isinstance(items, list) and items:
+                stripped_messages += 1
+                stripped_items += len(items)
+
+        self._codex_reasoning_replay_enabled = False
+        return {"messages": stripped_messages, "items": stripped_items}
+
+    # Stream-diagnostic class header preserved for backward compat —
+    # actual list lives in ``agent.stream_diag.STREAM_DIAG_HEADERS``.
+    from agent.stream_diag import STREAM_DIAG_HEADERS as _STREAM_DIAG_HEADERS  # noqa: E402
+
+    @staticmethod
+    def _stream_diag_init() -> Dict[str, Any]:
+        """Forwarder — see ``agent.stream_diag.stream_diag_init``."""
+        from agent.stream_diag import stream_diag_init
+        return stream_diag_init()
+
+    def _stream_diag_capture_response(
+        self, diag: Dict[str, Any], http_response: Any
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.stream_diag_capture_response``."""
+        from agent.stream_diag import stream_diag_capture_response
+        stream_diag_capture_response(self, diag, http_response)
+
+    @staticmethod
+    def _flatten_exception_chain(error: BaseException) -> str:
+        """Forwarder — see ``agent.stream_diag.flatten_exception_chain``."""
+        from agent.stream_diag import flatten_exception_chain
+        return flatten_exception_chain(error)
+
+    def _is_provider_stream_parse_error(self, error: BaseException) -> bool:
+        """Return True for malformed provider streaming data from SDK parsers.
+
+        Some Anthropic-compatible streaming providers can send a malformed
+        event-stream frame.  The Anthropic SDK surfaces that as a plain
+        ``ValueError`` such as ``expected ident at line 1 column 149``.  That
+        is provider wire-format trouble, not local request validation, so it
+        should follow the same retry path as a truncated JSON body.
+        """
+        if getattr(self, "api_mode", None) != "anthropic_messages":
+            return False
+        if not isinstance(error, ValueError):
+            return False
+        if isinstance(error, (UnicodeEncodeError, json.JSONDecodeError)):
+            return False
+        message = str(error).strip().lower()
+        return "expected ident at line" in message
+
+    def _log_stream_retry(
+        self,
+        *,
+        kind: str,
+        error: BaseException,
+        attempt: int,
+        max_attempts: int,
+        mid_tool_call: bool,
+        diag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.log_stream_retry``."""
+        from agent.stream_diag import log_stream_retry
+        log_stream_retry(
+            self, kind=kind, error=error, attempt=attempt,
+            max_attempts=max_attempts, mid_tool_call=mid_tool_call, diag=diag,
+        )
+
+    def _emit_stream_drop(
+        self,
+        *,
+        error: BaseException,
+        attempt: int,
+        max_attempts: int,
+        mid_tool_call: bool,
+        diag: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Forwarder — see ``agent.stream_diag.emit_stream_drop``."""
+        from agent.stream_diag import emit_stream_drop
+        emit_stream_drop(
+            self, error=error, attempt=attempt, max_attempts=max_attempts,
+            mid_tool_call=mid_tool_call, diag=diag,
+        )
+
     def _emit_auxiliary_failure(self, task: str, exc: BaseException) -> None:
         """Surface a compact warning for failed auxiliary work."""
         try:
@@ -3066,21 +2832,9 @@ class AIAgent:
             logger.debug("Compression feasibility check failed (non-fatal): %s", exc)
 
     def _replay_compression_warning(self) -> None:
-        """Re-send the compression warning through ``status_callback``.
-
-        During ``__init__`` the gateway's ``status_callback`` is not yet
-        wired, so ``_emit_status`` only reaches ``_vprint`` (CLI).  This
-        method is called once at the start of the first
-        ``run_conversation()`` — by then the gateway has set the callback,
-        so every platform (Telegram, Discord, Slack, etc.) receives the
-        warning.
-        """
-        msg = getattr(self, "_compression_warning", None)
-        if msg and self.status_callback:
-            try:
-                self.status_callback("lifecycle", msg)
-            except Exception:
-                pass
+        """Forwarder — see ``agent.conversation_compression.replay_compression_warning``."""
+        from agent.conversation_compression import replay_compression_warning
+        replay_compression_warning(self)
 
     def _is_direct_openai_url(self, base_url: str = None) -> bool:
         """Return True when a base URL targets OpenAI's native API."""
@@ -3135,7 +2889,11 @@ class AIAgent:
           1. ``providers.<id>.models.<model>.stale_timeout_seconds``
           2. ``providers.<id>.stale_timeout_seconds``
           3. ``HERMES_API_CALL_STALE_TIMEOUT`` env var
-          4. 300.0s default
+          4. 90.0s default (time-to-first-byte for non-streaming / Codex
+             internal-streaming requests; lowered from 300s in May 2026 so
+             fallback providers kick in faster when upstream providers
+             stall).  The detector still scales up for large contexts in
+             ``_compute_non_stream_stale_timeout``.
 
         Returns ``(timeout_seconds, uses_implicit_default)`` so the caller can
         preserve legacy behaviors that only apply when the user has *not*
@@ -3150,23 +2908,80 @@ class AIAgent:
         if env_timeout is not None:
             return float(env_timeout), False
 
-        return 300.0, True
+        return 90.0, True
 
-    def _compute_non_stream_stale_timeout(
-        self, messages: list[dict[str, Any]]
-    ) -> float:
-        """Compute the effective non-stream stale timeout for this request."""
+    def _compute_non_stream_stale_timeout(self, api_payload: Any) -> float:
+        """Compute the effective non-stream stale timeout for this request.
+
+        Accepts either the full ``api_kwargs`` dict (Chat Completions or
+        Responses API) or a legacy ``messages`` list.  Context-size scaling
+        applies the same way to both shapes via
+        :func:`agent.chat_completion_helpers.estimate_request_context_tokens`.
+        """
         stale_base, uses_implicit_default = self._resolved_api_call_stale_timeout_base()
         base_url = getattr(self, "_base_url", None) or self.base_url or ""
         if uses_implicit_default and base_url and is_local_endpoint(base_url):
             return float("inf")
 
-        est_tokens = sum(len(str(v)) for v in messages) // 4
+        from agent.chat_completion_helpers import estimate_request_context_tokens
+        est_tokens = estimate_request_context_tokens(api_payload)
         if est_tokens > 100_000:
-            return max(stale_base, 600.0)
+            return max(stale_base, 240.0)
         if est_tokens > 50_000:
-            return max(stale_base, 450.0)
+            return max(stale_base, 150.0)
         return stale_base
+
+    def _codex_silent_hang_hint(self, model: Optional[str] = None) -> Optional[str]:
+        """Return an actionable hint when this request matches a known
+        Codex silent-reject configuration, else ``None``.
+
+        The ChatGPT Codex backend (``chatgpt.com/backend-api/codex``) has
+        historically silently dropped certain model requests: the connection
+        is accepted but no stream events are emitted and no error is raised.
+        The stale-call detector ends the hang, but a generic "timed out"
+        message gives the user no path forward.
+
+        This helper substitutes an actionable hint into the stale-timeout
+        warning when the request matches a known silent-reject pattern.
+        Currently flagged: ``gpt-5.5`` family on the Codex backend.  See
+        hermes-agent #21444 for the symptom history.  The upstream backend
+        behavior has historically come and gone with ChatGPT entitlement
+        changes — the heuristic stays in place as future-proofing even when
+        the symptom is dormant.
+
+        Does NOT fix the backend issue.  Only converts an opaque stale-timeout
+        into actionable text so users learn the workaround in seconds rather
+        than digging through logs.
+        """
+        if self.api_mode != "codex_responses":
+            return None
+        is_codex_backend = (
+            self.provider == "openai-codex"
+            or (
+                getattr(self, "_base_url_hostname", "") == "chatgpt.com"
+                and "/backend-api/codex" in (getattr(self, "_base_url_lower", "") or "")
+            )
+        )
+        if not is_codex_backend:
+            return None
+        eff_model = (model if model is not None else self.model) or ""
+        model_lower = eff_model.lower()
+        # Match the gpt-5.5 family — bare ``gpt-5.5``, ``gpt-5.5-codex``,
+        # vendor-prefixed variants like ``openai/gpt-5.5``, and any future
+        # ``gpt-5.5-*`` SKU.  Anchor at a word boundary on either side so
+        # unrelated tokens like ``gpt-5.50`` do not match.
+        if not re.search(r"(?:^|[/\-_])gpt-5\.5(?:$|[\-_])", model_lower):
+            return None
+        return (
+            f"Codex backend appears to be silently rejecting {eff_model!r} "
+            "on chatgpt.com/backend-api/codex (no stream events, no error). "
+            "This is a known backend-side pattern that has affected ChatGPT "
+            "Plus accounts intermittently. "
+            "Workaround: try `gpt-5.4` on the same OAuth profile, or `gpt-5.3-codex`, "
+            "or switch to a different model/provider in your fallback chain. "
+            "Some ChatGPT Codex accounts do not support `gpt-5.4-codex`. "
+            "See hermes-agent#21444 for symptom history."
+        )
 
     def _is_openrouter_url(self) -> bool:
         """Return True when the base URL targets OpenRouter."""
@@ -3654,179 +3469,17 @@ class AIAgent:
         return None
 
     def _cleanup_task_resources(self, task_id: str) -> None:
-        """Clean up VM and browser resources for a given task.
-
-        Skips ``cleanup_vm`` when the active terminal environment is marked
-        persistent (``persistent_filesystem=True``) so that long-lived sandbox
-        containers survive between turns. The idle reaper in
-        ``terminal_tool._cleanup_inactive_envs`` still tears them down once
-        ``terminal.lifetime_seconds`` is exceeded. Non-persistent backends are
-        torn down per-turn as before to prevent resource leakage (the original
-        intent of this hook for the Morph backend, see commit fbd3a2fd).
-        """
-        try:
-            if is_persistent_env(task_id):
-                if self.verbose_logging:
-                    logging.debug(
-                        f"Skipping per-turn cleanup_vm for persistent env {task_id}; "
-                        f"idle reaper will handle it."
-                    )
-            else:
-                cleanup_vm(task_id)
-        except Exception as e:
-            if self.verbose_logging:
-                logging.warning(f"Failed to cleanup VM for task {task_id}: {e}")
-        try:
-            cleanup_browser(task_id)
-        except Exception as e:
-            if self.verbose_logging:
-                logging.warning(f"Failed to cleanup browser for task {task_id}: {e}")
+        """Forwarder — see ``agent.chat_completion_helpers.cleanup_task_resources``."""
+        from agent.chat_completion_helpers import cleanup_task_resources
+        return cleanup_task_resources(self, task_id)
 
     # ------------------------------------------------------------------
-    # Background memory/skill review
+    # Background memory/skill review — prompts live in agent.background_review
     # ------------------------------------------------------------------
-
-    _MEMORY_REVIEW_PROMPT = (
-        "Review the conversation above and consider saving to memory if appropriate.\n\n"
-        "Focus on:\n"
-        "1. Has the user revealed things about themselves — their persona, desires, "
-        "preferences, or personal details worth remembering?\n"
-        "2. Has the user expressed expectations about how you should behave, their work "
-        "style, or ways they want you to operate?\n\n"
-        "If something stands out, save it using the memory tool. "
-        "If nothing is worth saving, just say 'Nothing to save.' and stop."
-    )
-
-    _SKILL_REVIEW_PROMPT = (
-        "Review the conversation above and update the skill library. Be "
-        "ACTIVE — most sessions produce at least one skill update, even if "
-        "small. A pass that does nothing is a missed learning opportunity, "
-        "not a neutral outcome.\n\n"
-        "Target shape of the library: CLASS-LEVEL skills, each with a rich "
-        "SKILL.md and a `references/` directory for session-specific detail. "
-        "Not a long flat list of narrow one-session-one-skill entries. This "
-        "shapes HOW you update, not WHETHER you update.\n\n"
-        "Signals to look for (any one of these warrants action):\n"
-        "  • User corrected your style, tone, format, legibility, or "
-        "verbosity. Frustration signals like 'stop doing X', 'this is too "
-        "verbose', 'don't format like this', 'why are you explaining', "
-        "'just give me the answer', 'you always do Y and I hate it', or an "
-        "explicit 'remember this' are FIRST-CLASS skill signals, not just "
-        "memory signals. Update the relevant skill(s) to embed the "
-        "preference so the next session starts already knowing.\n"
-        "  • User corrected your workflow, approach, or sequence of steps. "
-        "Encode the correction as a pitfall or explicit step in the skill "
-        "that governs that class of task.\n"
-        "  • Non-trivial technique, fix, workaround, debugging path, or "
-        "tool-usage pattern emerged that a future session would benefit "
-        "from. Capture it.\n"
-        "  • A skill that got loaded or consulted this session turned out "
-        "to be wrong, missing a step, or outdated. Patch it NOW.\n\n"
-        "Preference order — prefer the earliest action that fits, but do "
-        "pick one when a signal above fired:\n"
-        "  1. UPDATE A CURRENTLY-LOADED SKILL. Look back through the "
-        "conversation for skills the user loaded via /skill-name or you "
-        "read via skill_view. If any of them covers the territory of the "
-        "new learning, PATCH that one first. It is the skill that was in "
-        "play, so it's the right one to extend.\n"
-        "  2. UPDATE AN EXISTING UMBRELLA (via skills_list + skill_view). "
-        "If no loaded skill fits but an existing class-level skill does, "
-        "patch it. Add a subsection, a pitfall, or broaden a trigger.\n"
-        "  3. ADD A SUPPORT FILE under an existing umbrella. Skills can be "
-        "packaged with three kinds of support files — use the right "
-        "directory per kind:\n"
-        "     • `references/<topic>.md` — session-specific detail (error "
-        "transcripts, reproduction recipes, provider quirks) AND "
-        "condensed knowledge banks: quoted research, API docs, external "
-        "authoritative excerpts, or domain notes you found while working "
-        "on the problem. Write it concise and for the value of the task, "
-        "not as a full mirror of upstream docs.\n"
-        "     • `templates/<name>.<ext>` — starter files meant to be "
-        "copied and modified (boilerplate configs, scaffolding, a "
-        "known-good example the agent can `reproduce with modifications`).\n"
-        "     • `scripts/<name>.<ext>` — statically re-runnable actions "
-        "the skill can invoke directly (verification scripts, fixture "
-        "generators, deterministic probes, anything the agent should run "
-        "rather than hand-type each time).\n"
-        "     Add support files via skill_manage action=write_file with "
-        "file_path starting 'references/', 'templates/', or 'scripts/'. "
-        "The umbrella's SKILL.md should gain a one-line pointer to any "
-        "new support file so future agents know it exists.\n"
-        "  4. CREATE A NEW CLASS-LEVEL UMBRELLA SKILL when no existing "
-        "skill covers the class. The name MUST be at the class level. "
-        "The name MUST NOT be a specific PR number, error string, feature "
-        "codename, library-alone name, or 'fix-X / debug-Y / audit-Z-today' "
-        "session artifact. If the proposed name only makes sense for "
-        "today's task, it's wrong — fall back to (1), (2), or (3).\n\n"
-        "User-preference embedding (important): when the user expressed a "
-        "style/format/workflow preference, the update belongs in the "
-        "SKILL.md body, not just in memory. Memory captures 'who the user "
-        "is and what the current situation and state of your operations "
-        "are'; skills capture 'how to do this class of task for this "
-        "user'. When they complain about how you handled a task, the "
-        "skill that governs that task needs to carry the lesson.\n\n"
-        "If you notice two existing skills that overlap, note it in your "
-        "reply — the background curator handles consolidation at scale.\n\n"
-        "'Nothing to save.' is a real option but should NOT be the "
-        "default. If the session ran smoothly with no corrections and "
-        "produced no new technique, just say 'Nothing to save.' and stop. "
-        "Otherwise, act."
-    )
-
-    _COMBINED_REVIEW_PROMPT = (
-        "Review the conversation above and update two things:\n\n"
-        "**Memory**: who the user is. Did the user reveal persona, "
-        "desires, preferences, personal details, or expectations about "
-        "how you should behave? Save facts about the user and durable "
-        "preferences with the memory tool.\n\n"
-        "**Skills**: how to do this class of task. Be ACTIVE — most "
-        "sessions produce at least one skill update. A pass that does "
-        "nothing is a missed learning opportunity, not a neutral outcome.\n\n"
-        "Target shape of the skill library: CLASS-LEVEL skills with a rich "
-        "SKILL.md and a `references/` directory for session-specific detail. "
-        "Not a long flat list of narrow one-session-one-skill entries.\n\n"
-        "Signals that warrant a skill update (any one is enough):\n"
-        "  • User corrected your style, tone, format, legibility, "
-        "verbosity, or approach. Frustration is a FIRST-CLASS skill "
-        "signal, not just a memory signal. 'stop doing X', 'don't format "
-        "like this', 'I hate when you Y' — embed the lesson in the skill "
-        "that governs that task so the next session starts fixed.\n"
-        "  • Non-trivial technique, fix, workaround, or debugging path "
-        "emerged.\n"
-        "  • A skill that was loaded or consulted turned out wrong, "
-        "missing, or outdated — patch it now.\n\n"
-        "Preference order for skills — pick the earliest that fits:\n"
-        "  1. UPDATE A CURRENTLY-LOADED SKILL. Check what skills were "
-        "loaded via /skill-name or skill_view in the conversation. If one "
-        "of them covers the learning, PATCH it first. It was in play; "
-        "it's the right place.\n"
-        "  2. UPDATE AN EXISTING UMBRELLA (skills_list + skill_view to "
-        "find the right one). Patch it.\n"
-        "  3. ADD A SUPPORT FILE under an existing umbrella via "
-        "skill_manage action=write_file. Three kinds: "
-        "`references/<topic>.md` for session-specific detail OR condensed "
-        "knowledge banks (quoted research, API docs excerpts, domain "
-        "notes) written concise and task-focused; `templates/<name>.<ext>` "
-        "for starter files meant to be copied and modified; "
-        "`scripts/<name>.<ext>` for statically re-runnable actions "
-        "(verification, fixture generators, probes). Add a one-line "
-        "pointer in SKILL.md so future agents find them.\n"
-        "  4. CREATE A NEW CLASS-LEVEL UMBRELLA when nothing exists. "
-        "Name at the class level — NOT a PR number, error string, "
-        "codename, library-alone name, or 'fix-X / debug-Y' session "
-        "artifact. If the name only fits today's task, fall back to (1), "
-        "(2), or (3).\n\n"
-        "User-preference embedding: when the user complains about how "
-        "you handled a task, update the skill that governs that task — "
-        "memory alone isn't enough. Memory says 'who the user is and "
-        "what the current situation and state of your operations are'; "
-        "skills say 'how to do this class of task for this user'. Both "
-        "should carry user-preference lessons when relevant.\n\n"
-        "If you notice overlapping existing skills, mention it — the "
-        "background curator handles consolidation.\n\n"
-        "Act on whichever of the two dimensions has real signal. If "
-        "genuinely nothing stands out on either, say 'Nothing to save.' "
-        "and stop — but don't reach for that conclusion as a default."
+    from agent.background_review import (
+        _MEMORY_REVIEW_PROMPT,
+        _SKILL_REVIEW_PROMPT,
+        _COMBINED_REVIEW_PROMPT,
     )
 
     @staticmethod
@@ -3919,12 +3572,13 @@ class AIAgent:
         review_memory: bool = False,
         review_skills: bool = False,
     ) -> None:
-        """Spawn a background thread to review the conversation for memory/skill saves.
+        """Spawn the background memory/skill review thread.
 
-        Creates a full AIAgent fork with the same model, tools, and context as the
-        main session. The review prompt is appended as the next user turn in the
-        forked conversation. Writes directly to the shared memory/skill stores.
-        Never modifies the main conversation history or produces user-visible output.
+        Thin wrapper — the heavy lifting lives in
+        ``agent.background_review.spawn_background_review_thread`` which
+        returns the thread target.  ``threading.Thread`` is constructed
+        here so existing tests that patch ``run_agent.threading.Thread``
+        keep working.
         """
         import threading
 
@@ -4133,6 +3787,20 @@ class AIAgent:
             for msg in messages[flush_from:]:
                 role = msg.get("role", "unknown")
                 content = msg.get("content")
+                # Persist multimodal tool results as their text summary only —
+                # base64 images would bloat the session DB and aren't useful
+                # for cross-session replay.
+                if _is_multimodal_tool_result(content):
+                    content = _multimodal_text_summary(content)
+                elif isinstance(content, list):
+                    # List of OpenAI-style content parts: strip images, keep text.
+                    _txt = []
+                    for p in content:
+                        if isinstance(p, dict) and p.get("type") == "text":
+                            _txt.append(str(p.get("text", "")))
+                        elif isinstance(p, dict) and p.get("type") in {"image", "image_url", "input_image"}:
+                            _txt.append("[screenshot]")
+                    content = "\n".join(_txt) if _txt else None
                 tool_calls_data = None
                 if (
                     hasattr(msg, "tool_calls")
@@ -4406,6 +4074,74 @@ class AIAgent:
         _save_trajectory_to_file(trajectory, self.model, completed)
 
     @staticmethod
+    def _is_entitlement_failure(
+        error_context: Optional[Dict[str, Any]],
+        status_code: Optional[int],
+    ) -> bool:
+        """Detect subscription/entitlement 403s that masquerade as auth failures.
+
+        Returned True only when the body text matches a known entitlement
+        shape AND the status is 401/403.  Refreshing an OAuth token cannot
+        fix an unsubscribed account, so callers should surface the error
+        instead of looping the credential pool.
+
+        Current matches:
+          * xAI OAuth: "do not have an active Grok subscription" /
+            "out of available resources" / "does not have permission" + "grok"
+
+        Disambiguator for xAI (#29344): the same ``code`` text ("The caller
+        does not have permission to execute the specified operation") is
+        returned for BOTH an unsubscribed account AND a stale OAuth access
+        token.  xAI ships an explicit signal in the ``error`` field that
+        tells the two apart: a ``[WKE=unauthenticated:...]`` suffix (and/or
+        the ``OAuth2 access token could not be validated`` phrasing) means
+        the credentials failed validation — that's recoverable by refreshing
+        the token, NOT by surfacing an entitlement message.  When either
+        signal is present we return False eagerly so the credential-pool
+        refresh path runs, letting long-running TUI sessions recover from
+        stale tokens without an exit/reopen cycle.
+
+        Extend here for new providers as we discover them (Anthropic's
+        Claude Max OAuth entitlement errors look distinct enough today that
+        the existing 1M-context-beta branch handles them; revisit if other
+        subscription tiers start producing the same loop signature).
+        """
+        if status_code not in {401, 403, None}:
+            return False
+        if not isinstance(error_context, dict):
+            return False
+        # Build a single lowercase haystack covering every field shape the
+        # body might land in.  ``_extract_api_error_context`` normalises to
+        # ``message``/``reason``, but callers (and the test suite) may also
+        # hand us the raw body with ``code``/``error`` keys; cover both so
+        # the WKE disambiguator below fires regardless of entry point.
+        message = str(error_context.get("message") or "").lower()
+        reason = str(error_context.get("reason") or "").lower()
+        code = str(error_context.get("code") or "").lower()
+        err = str(error_context.get("error") or "").lower()
+        haystack = f"{message} {reason} {code} {err}"
+        if not haystack.strip():
+            return False
+        # xAI's authoritative disambiguator for "stale token" vs
+        # "unsubscribed account".  Both conditions share the same
+        # permission-denied ``code`` text; only one carries this suffix.
+        # Bail out before the entitlement keyword checks so a stale OAuth
+        # token routes through the credential-refresh path instead of the
+        # surface-error-as-entitlement path.  See #29344 for the long-
+        # running TUI failure mode this closes.
+        if "[wke=unauthenticated:" in haystack:
+            return False
+        if "oauth2 access token could not be validated" in haystack:
+            return False
+        if "do not have an active grok subscription" in haystack:
+            return True
+        if "out of available resources" in haystack and "grok" in haystack:
+            return True
+        if "does not have permission" in haystack and "grok" in haystack:
+            return True
+        return False
+
+    @staticmethod
     def _summarize_api_error(error: Exception) -> str:
         """Extract a human-readable one-liner from an API error.
 
@@ -4424,6 +4160,12 @@ class AIAgent:
         """
         raw = str(error)
         status_code = getattr(error, "status_code", None)
+
+        if (
+            isinstance(error, ValueError)
+            and "expected ident at line" in raw.lower()
+        ):
+            return f"Malformed provider streaming response: {raw[:300]}"
 
         # Cloudflare / proxy HTML pages: grab the <title> for a clean summary
         if "<!DOCTYPE" in raw or "<html" in raw:
@@ -4479,7 +4221,11 @@ class AIAgent:
         prefix = f"HTTP {status_code}: " if status_code else ""
         return f"{prefix}{raw[:500]}"
 
-    def _mask_api_key_for_logs(self, key: Optional[str]) -> Optional[str]:
+    def _mask_api_key_for_logs(self, key: Any) -> Optional[str]:
+        # Azure Foundry Entra ID bearer providers are callables — never
+        # invoke them in log paths; identify the auth surface instead.
+        if callable(key) and not isinstance(key, str):
+            return "<entra-id-bearer>"
         if not key:
             return None
         if len(key) <= 12:
@@ -4705,36 +4451,85 @@ class AIAgent:
         content = re.sub(r"(</think>)\n+", r"\1\n", content)
         return content.strip()
 
+    @staticmethod
+    def _redact_message_content(content):
+        """Apply secret redaction to message content (str or list-of-parts).
+
+        Handles both plain-string content and the OpenAI/Anthropic multimodal
+        shape where ``content`` is a list of ``{"type": "text", "text": ...}``
+        / ``{"type": "image_url", ...}`` / ``{"type": "input_text", "content": ...}``
+        parts. Image / binary parts are left untouched; only text fields are
+        passed through ``redact_sensitive_text``.
+
+        Respects ``HERMES_REDACT_SECRETS`` via ``redact_sensitive_text`` —
+        when disabled the helper is effectively a no-op.
+        """
+        if content is None:
+            return content
+        if isinstance(content, str):
+            return redact_sensitive_text(content)
+        if isinstance(content, list):
+            redacted = []
+            for part in content:
+                if isinstance(part, dict):
+                    part = dict(part)
+                    if isinstance(part.get("text"), str):
+                        part["text"] = redact_sensitive_text(part["text"])
+                    if isinstance(part.get("content"), str):
+                        part["content"] = redact_sensitive_text(part["content"])
+                redacted.append(part)
+            return redacted
+        return content
+
     def _save_session_log(self, messages: List[Dict[str, Any]] = None):
-        """
-        Save the full raw session to a JSON file.
+        """Optional per-session JSON snapshot writer.
 
-        Stores every message exactly as the agent sees it: user messages,
-        assistant messages (with reasoning, finish_reason, tool_calls),
-        tool responses (with tool_call_id, tool_name), and injected system
-        messages (compression summaries, todo snapshots, etc.).
+        Gated by ``sessions.write_json_snapshots`` (default False).  state.db
+        is the canonical message store; this writer exists only for users
+        whose external tooling consumes ``~/.hermes/sessions/session_{sid}.json``
+        directly.  When the flag is off this is a fast no-op.
 
-        REASONING_SCRATCHPAD tags are converted to <think> blocks for consistency.
-        Overwritten after each turn so it always reflects the latest state.
+        When enabled, rewrites the snapshot after every persistence point with
+        the full message list (assistant content normalized via
+        ``_clean_session_content`` to convert REASONING_SCRATCHPAD to think
+        tags).  The truncation guard ("don't overwrite a larger log with
+        fewer messages") is preserved so resume + branch don't clobber a
+        fuller existing snapshot.
         """
+        if not getattr(self, "_session_json_enabled", False):
+            return
         messages = messages or self._session_messages
         if not messages:
             return
 
+        # Re-derive the target path each call so /branch and /compress
+        # session-id changes land in the right file without any re-point
+        # bookkeeping at the call sites.
         try:
-            # Clean assistant content for session logs
+            log_file = self.logs_dir / f"session_{self.session_id}.json"
+        except Exception:
+            return
+
+        try:
             cleaned = []
             for msg in messages:
                 if msg.get("role") == "assistant" and msg.get("content"):
                     msg = dict(msg)
                     msg["content"] = self._clean_session_content(msg["content"])
+                # Defence-in-depth: redact credentials from every message
+                # content before persistence. Catches PATs / API keys / Bearer
+                # tokens that may have leaked into assistant responses, tool
+                # output, or user paste. Respects HERMES_REDACT_SECRETS via
+                # redact_sensitive_text — no-op when disabled. (#19798, #19845)
+                if "content" in msg:
+                    msg = dict(msg)
+                    msg["content"] = self._redact_message_content(msg.get("content"))
                 cleaned.append(msg)
 
             # Guard: never overwrite a larger session log with fewer messages.
-            # This protects against data loss when --resume loads a session whose
-            # messages weren't fully written to SQLite — the resumed agent starts
-            # with partial history and would otherwise clobber the full JSON log.
-            if self.session_log_file.exists():
+            # Protects against data loss when a resumed agent starts with
+            # partial history and would otherwise clobber the full JSON log.
+            if log_file.exists():
                 try:
                     existing = json.loads(
                         self.session_log_file.read_text(encoding="utf-8")
@@ -4759,14 +4554,14 @@ class AIAgent:
                 "platform": self.platform,
                 "session_start": self.session_start.isoformat(),
                 "last_updated": datetime.now().isoformat(),
-                "system_prompt": self._cached_system_prompt or "",
+                "system_prompt": redact_sensitive_text(self._cached_system_prompt or ""),
                 "tools": self.tools or [],
                 "message_count": len(cleaned),
                 "messages": cleaned,
             }
 
             atomic_json_write(
-                self.session_log_file,
+                log_file,
                 entry,
                 indent=2,
                 default=str,
@@ -4775,6 +4570,7 @@ class AIAgent:
         except Exception as e:
             if self.verbose_logging:
                 logging.warning(f"Failed to save session log: {e}")
+
 
     def interrupt(self, message: str = None) -> None:
         """
@@ -4943,21 +4739,16 @@ class AIAgent:
     ) -> None:
         """Append any pending /steer text to the last tool result in this turn.
 
-        Called at the end of a tool-call batch, before the next API call.
-        The steer is appended to the last ``role:"tool"`` message's content
-        with a clear marker so the model understands it came from the user
-        and NOT from the tool itself. Role alternation is preserved —
-        nothing new is inserted, we only modify existing content.
-
-        Args:
-            messages: The running messages list.
-            num_tool_msgs: Number of tool results appended in this batch;
-                used to locate the tail slice safely.
+        On failure, store ``{path: {error_preview, tool}}`` entries.  On
+        success, remove any prior failure entries for the same paths (the
+        model recovered within the turn).  Silently no-ops if the per-turn
+        state dict hasn't been initialised yet (e.g. a tool dispatched
+        outside ``run_conversation``).
         """
-        if num_tool_msgs <= 0 or not messages:
+        if tool_name not in _FILE_MUTATING_TOOLS:
             return
-        steer_text = self._drain_pending_steer()
-        if not steer_text:
+        state = getattr(self, "_turn_failed_file_mutations", None)
+        if state is None:
             return
         # Find the last tool-role message in the recent tail. Skipping
         # non-tool messages defends against future code appending
@@ -4987,25 +4778,85 @@ class AIAgent:
                     (existing + "\n" + steer_text) if existing else steer_text
                 )
             return
-        marker = f"\n\nUser guidance: {steer_text}"
-        existing_content = messages[target_idx].get("content", "")
-        if not isinstance(existing_content, str):
-            # Anthropic multimodal content blocks — preserve them and append
-            # a text block at the end.
-            try:
-                blocks = list(existing_content) if existing_content else []
-                blocks.append({"type": "text", "text": marker.lstrip()})
-                messages[target_idx]["content"] = blocks
-            except Exception:
-                # Fall back to string replacement if content shape is unexpected.
-                messages[target_idx]["content"] = f"{existing_content}{marker}"
+        landed = file_mutation_result_landed(tool_name, result)
+        if is_error and not landed:
+            preview = _extract_error_preview(result)
+            for path in targets:
+                # Keep the FIRST error we saw for a given path unless we
+                # later see success.  A repeated failure with a different
+                # message shouldn't silently overwrite the original.
+                if path not in state:
+                    state[path] = {
+                        "tool": tool_name,
+                        "error_preview": preview,
+                    }
         else:
-            messages[target_idx]["content"] = existing_content + marker
-        logger.info(
-            "Delivered /steer to agent after tool batch (%d chars): %s",
-            len(steer_text),
-            steer_text[:120] + ("..." if len(steer_text) > 120 else ""),
-        )
+            for path in targets:
+                state.pop(path, None)
+
+    def _file_mutation_verifier_enabled(self) -> bool:
+        """Check whether the per-turn file-mutation verifier footer is on.
+
+        Config path: ``display.file_mutation_verifier`` (bool, default True).
+        ``HERMES_FILE_MUTATION_VERIFIER`` env var overrides config.  Exposed
+        as a method so tests can patch a single seam without reaching into
+        the private ``_turn_failed_file_mutations`` state dict.
+        """
+        try:
+            import os as _os
+            env = _os.environ.get("HERMES_FILE_MUTATION_VERIFIER")
+            if env is not None:
+                return env.strip().lower() not in {"0", "false", "no", "off"}
+            # Read from the persisted config.yaml so gateway and CLI share
+            # the same setting.  Import lazily to avoid a startup-time cycle.
+            try:
+                from hermes_cli.config import load_config as _load_config
+                _cfg = _load_config() or {}
+            except Exception:
+                _cfg = {}
+            _display = _cfg.get("display") if isinstance(_cfg, dict) else None
+            if isinstance(_display, dict) and "file_mutation_verifier" in _display:
+                return bool(_display.get("file_mutation_verifier"))
+        except Exception:
+            pass
+        return True  # safe default: verifier on
+
+    @staticmethod
+    def _format_file_mutation_failure_footer(failed: Dict[str, Dict[str, Any]]) -> str:
+        """Render the per-turn failed-mutation dict as a user-facing footer.
+
+        Displays up to 10 paths with their first error preview, then a
+        count of any additional failures.  Returns an empty string when
+        the dict is empty so callers can concatenate unconditionally.
+        """
+        if not failed:
+            return ""
+        lines = [
+            "⚠️ File-mutation verifier: "
+            f"{len(failed)} file(s) were NOT modified this turn despite any "
+            "wording above that may suggest otherwise. Run `git status` or "
+            "`read_file` to confirm."
+        ]
+        shown = 0
+        for path, info in failed.items():
+            if shown >= 10:
+                break
+            preview = (info.get("error_preview") or "").strip()
+            tool = info.get("tool") or "patch"
+            if preview:
+                lines.append(f"  • {path} — [{tool}] {preview}")
+            else:
+                lines.append(f"  • {path} — [{tool}] failed")
+            shown += 1
+        remaining = len(failed) - shown
+        if remaining > 0:
+            lines.append(f"  • … and {remaining} more")
+        return "\n".join(lines)
+
+    def _apply_pending_steer_to_tool_results(self, messages: list, num_tool_msgs: int) -> None:
+        """Forwarder — see ``agent.agent_runtime_helpers.apply_pending_steer_to_tool_results``."""
+        from agent.agent_runtime_helpers import apply_pending_steer_to_tool_results
+        return apply_pending_steer_to_tool_results(self, messages, num_tool_msgs)
 
     def _touch_activity(self, desc: str) -> None:
         """Update the last-activity timestamp and description (thread-safe)."""
@@ -5099,6 +4950,7 @@ class AIAgent:
         original_user_message: Any,
         final_response: Any,
         interrupted: bool,
+        messages: list | None = None,
     ) -> None:
         """Mirror a completed turn into external memory providers.
 
@@ -5131,6 +4983,9 @@ class AIAgent:
         if not (self._memory_manager and final_response and original_user_message):
             return
         try:
+            sync_kwargs = {"session_id": self.session_id or ""}
+            if messages is not None:
+                sync_kwargs["messages"] = messages
             self._memory_manager.sync_all(
                 original_user_message,
                 final_response,
@@ -5619,7 +5474,7 @@ class AIAgent:
                         return False
                     continue
                 btype = block.get("type")
-                if btype in ("thinking", "redacted_thinking"):
+                if btype in {"thinking", "redacted_thinking"}:
                     continue
                 if btype == "text":
                     text = block.get("text", "")
@@ -5644,86 +5499,9 @@ class AIAgent:
     def _drop_thinking_only_and_merge_users(
         messages: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        """Drop thinking-only assistant turns; merge any adjacent user messages left behind.
-
-        Runs on the per-call ``api_messages`` copy only. The stored
-        conversation history (``self.messages``) is never mutated, so the
-        user still sees the thinking block in the CLI/gateway transcript and
-        session persistence keeps the full trace. Only the wire copy sent to
-        the provider is cleaned.
-
-        Why drop-and-merge rather than inject stub text:
-        - Fabricating ``"."`` / ``"(continued)"`` text lies in the history
-          and makes future turns see model output the model didn't emit.
-        - Dropping the turn preserves honesty; merging adjacent user messages
-          preserves the provider's role-alternation invariant.
-        - This is the pattern used by Claude Code's ``normalizeMessagesForAPI``
-          (filterOrphanedThinkingOnlyMessages + mergeAdjacentUserMessages).
-        """
-        if not messages:
-            return messages
-
-        # Pass 1: drop thinking-only assistant turns.
-        kept = [m for m in messages if not AIAgent._is_thinking_only_assistant(m)]
-        dropped = len(messages) - len(kept)
-        if dropped == 0:
-            return messages
-
-        # Pass 2: merge any newly-adjacent user messages.
-        merged: List[Dict[str, Any]] = []
-        merges = 0
-        for m in kept:
-            prev = merged[-1] if merged else None
-            if (
-                prev is not None
-                and prev.get("role") == "user"
-                and m.get("role") == "user"
-            ):
-                prev_content = prev.get("content", "")
-                cur_content = m.get("content", "")
-                # Work on a copy of ``prev`` so the caller's input dicts are
-                # never mutated. ``_sanitize_api_messages`` upstream already
-                # hands us per-call copies, but staying pure here means we
-                # can be called safely from anywhere (tests, other loops).
-                prev_copy = dict(prev)
-                # Only string-content merge is meaningful for role-alternation
-                # purposes. If either side is a list (multimodal), append as a
-                # separate block rather than collapsing.
-                if isinstance(prev_content, str) and isinstance(cur_content, str):
-                    sep = "\n\n" if prev_content and cur_content else ""
-                    prev_copy["content"] = prev_content + sep + cur_content
-                elif isinstance(prev_content, list) and isinstance(cur_content, list):
-                    prev_copy["content"] = list(prev_content) + list(cur_content)
-                elif isinstance(prev_content, list) and isinstance(cur_content, str):
-                    if cur_content:
-                        prev_copy["content"] = list(prev_content) + [
-                            {"type": "text", "text": cur_content}
-                        ]
-                    else:
-                        prev_copy["content"] = list(prev_content)
-                elif isinstance(prev_content, str) and isinstance(cur_content, list):
-                    new_blocks: List[Dict[str, Any]] = []
-                    if prev_content:
-                        new_blocks.append({"type": "text", "text": prev_content})
-                    new_blocks.extend(cur_content)
-                    prev_copy["content"] = new_blocks
-                else:
-                    # Unknown content shape — fall back to appending separately
-                    # (violates alternation, but safer than raising in a hot path).
-                    merged.append(m)
-                    continue
-                merged[-1] = prev_copy
-                merges += 1
-            else:
-                merged.append(m)
-
-        logger.debug(
-            "Pre-call sanitizer: dropped %d thinking-only assistant turn(s), "
-            "merged %d adjacent user message(s)",
-            dropped,
-            merges,
-        )
-        return merged
+        """Forwarder — see ``agent.agent_runtime_helpers.drop_thinking_only_and_merge_users``."""
+        from agent.agent_runtime_helpers import drop_thinking_only_and_merge_users
+        return drop_thinking_only_and_merge_users(messages)
 
     @staticmethod
     def _cap_delegate_task_calls(tool_calls: list) -> list:
@@ -5779,76 +5557,9 @@ class AIAgent:
         return unique if len(unique) < len(tool_calls) else tool_calls
 
     def _repair_tool_call(self, tool_name: str) -> str | None:
-        """Attempt to repair a mismatched tool name before aborting.
-
-        Models sometimes emit variants of a tool name that differ only
-        in casing, separators, or class-like suffixes. Normalize
-        aggressively before falling back to fuzzy match:
-
-        1. Lowercase direct match.
-        2. Lowercase + hyphens/spaces -> underscores.
-        3. CamelCase -> snake_case (TodoTool -> todo_tool).
-        4. Strip trailing ``_tool`` / ``-tool`` / ``tool`` suffix that
-           Claude-style models sometimes tack on (TodoTool_tool ->
-           TodoTool -> Todo -> todo). Applied twice so double-tacked
-           suffixes like ``TodoTool_tool`` reduce all the way.
-        5. Fuzzy match (difflib, cutoff=0.7).
-
-        See #14784 for the original reports (TodoTool_tool, Patch_tool,
-        BrowserClick_tool were all returning "Unknown tool" before).
-
-        Returns the repaired name if found in valid_tool_names, else None.
-        """
-        import re
-        from difflib import get_close_matches
-
-        if not tool_name:
-            return None
-
-        def _norm(s: str) -> str:
-            return s.lower().replace("-", "_").replace(" ", "_")
-
-        def _camel_snake(s: str) -> str:
-            return re.sub(r"(?<!^)(?=[A-Z])", "_", s).lower()
-
-        def _strip_tool_suffix(s: str) -> str | None:
-            lc = s.lower()
-            for suffix in ("_tool", "-tool", "tool"):
-                if lc.endswith(suffix):
-                    return s[: -len(suffix)].rstrip("_-")
-            return None
-
-        # Cheap fast-paths first — these cover the common case.
-        lowered = tool_name.lower()
-        if lowered in self.valid_tool_names:
-            return lowered
-        normalized = _norm(tool_name)
-        if normalized in self.valid_tool_names:
-            return normalized
-
-        # Build the full candidate set for class-like emissions.
-        cands: set[str] = {tool_name, lowered, normalized, _camel_snake(tool_name)}
-        # Strip trailing tool-suffix up to twice — TodoTool_tool needs it.
-        for _ in range(2):
-            extra: set[str] = set()
-            for c in cands:
-                stripped = _strip_tool_suffix(c)
-                if stripped:
-                    extra.add(stripped)
-                    extra.add(_norm(stripped))
-                    extra.add(_camel_snake(stripped))
-            cands |= extra
-
-        for c in cands:
-            if c and c in self.valid_tool_names:
-                return c
-
-        # Fuzzy match as last resort.
-        matches = get_close_matches(lowered, self.valid_tool_names, n=1, cutoff=0.7)
-        if matches:
-            return matches[0]
-
-        return None
+        """Forwarder — see ``agent.agent_runtime_helpers.repair_tool_call``."""
+        from agent.agent_runtime_helpers import repair_tool_call
+        return repair_tool_call(self, tool_name)
 
     def _invalidate_system_prompt(self):
         """
@@ -6567,15 +6278,60 @@ class AIAgent:
         )
 
     def _try_refresh_codex_client_credentials(self, *, force: bool = True) -> bool:
-        if self.api_mode != "codex_responses" or self.provider != "openai-codex":
+        if self.api_mode != "codex_responses" or self.provider not in {"openai-codex", "xai-oauth"}:
+            return False
+
+        # Guard against silent account swap.
+        #
+        # When an agent is using a non-singleton credential — e.g. a manual
+        # pool entry (``hermes auth add xai-oauth``) whose tokens belong to
+        # a different account than the loopback_pkce singleton, or an agent
+        # constructed with an explicit ``api_key=`` arg — force-refreshing
+        # the singleton here and adopting its tokens silently re-routes the
+        # rest of the conversation onto the singleton's account.  The
+        # credential pool's reactive recovery (``_recover_with_credential_pool``)
+        # is the right channel for that case; this path is the
+        # singleton-only fallback used when the pool can't recover, and
+        # MUST only fire when the agent really is on singleton tokens.
+        try:
+            if self.provider == "openai-codex":
+                from hermes_cli.auth import resolve_codex_runtime_credentials
+
+                singleton_now = resolve_codex_runtime_credentials(
+                    refresh_if_expiring=False,
+                )
+            else:
+                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+                singleton_now = resolve_xai_oauth_runtime_credentials(
+                    refresh_if_expiring=False,
+                )
+        except Exception as exc:
+            logger.debug("%s singleton read failed: %s", self.provider, exc)
+            return False
+
+        singleton_key = str(singleton_now.get("api_key") or "").strip()
+        active_key = str(self.api_key or "").strip()
+        if singleton_key and active_key and singleton_key != active_key:
+            logger.debug(
+                "%s singleton tokens differ from the active api_key; "
+                "skipping singleton force-refresh to avoid silent account swap. "
+                "Reactive credential rotation should go through the pool.",
+                self.provider,
+            )
             return False
 
         try:
-            from hermes_cli.auth import resolve_codex_runtime_credentials
+            if self.provider == "openai-codex":
+                from hermes_cli.auth import resolve_codex_runtime_credentials
 
-            creds = resolve_codex_runtime_credentials(force_refresh=force)
+                creds = resolve_codex_runtime_credentials(force_refresh=force)
+            else:
+                from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+                creds = resolve_xai_oauth_runtime_credentials(force_refresh=force)
         except Exception as exc:
-            logger.debug("Codex credential refresh failed: %s", exc)
+            logger.debug("%s credential refresh failed: %s", self.provider, exc)
             return False
 
         api_key = creds.get("api_key")
@@ -6590,24 +6346,38 @@ class AIAgent:
         self._client_kwargs["api_key"] = self.api_key
         self._client_kwargs["base_url"] = self.base_url
 
-        if not self._replace_primary_openai_client(reason="codex_credential_refresh"):
+        if not self._replace_primary_openai_client(reason=f"{self.provider}_credential_refresh"):
             return False
 
         return True
 
-    def _try_refresh_nous_client_credentials(self, *, force: bool = True) -> bool:
+    def _try_refresh_nous_client_credentials(
+        self,
+        *,
+        force: bool = True,
+        inference_auth_mode: str | None = None,
+    ) -> bool:
         if self.api_mode != "chat_completions" or self.provider != "nous":
             return False
 
         try:
-            from hermes_cli.auth import resolve_nous_runtime_credentials
+            from hermes_cli.auth import (
+                NOUS_INFERENCE_AUTH_MODE_AUTO,
+                NOUS_INFERENCE_AUTH_MODE_LEGACY,
+                resolve_nous_runtime_credentials,
+            )
 
+            selected_auth_mode = inference_auth_mode or (
+                NOUS_INFERENCE_AUTH_MODE_LEGACY
+                if force
+                else NOUS_INFERENCE_AUTH_MODE_AUTO
+            )
             creds = resolve_nous_runtime_credentials(
                 min_key_ttl_seconds=max(
                     60, int(os.getenv("HERMES_NOUS_MIN_KEY_TTL_SECONDS", "1800"))
                 ),
                 timeout_seconds=float(os.getenv("HERMES_NOUS_TIMEOUT_SECONDS", "15")),
-                force_mint=force,
+                inference_auth_mode=selected_auth_mode,
             )
         except Exception as exc:
             logger.debug("Nous credential refresh failed: %s", exc)
@@ -8762,18 +8532,20 @@ class AIAgent:
         Used to decide whether to strip image content parts from API-bound
         messages (for non-vision models) or let the provider adapter handle
         them natively (for vision-capable models).
+
+        Resolution order (see ``agent.image_routing._supports_vision_override``):
+          1. ``model.supports_vision`` (top-level, single-model shortcut)
+          2. ``providers.<provider>.models.<model>.supports_vision``
+          3. models.dev capability lookup
+        Custom/local models absent from models.dev would otherwise be
+        misclassified as non-vision and have their images stripped.
         """
         try:
             from agent.models_dev import get_model_capabilities
 
             provider = (getattr(self, "provider", "") or "").strip()
             model = (getattr(self, "model", "") or "").strip()
-            if not provider or not model:
-                return False
-            caps = get_model_capabilities(provider, model)
-            if caps is None:
-                return False
-            return bool(caps.supports_vision)
+            return _lookup_supports_vision(provider, model, cfg) is True
         except Exception:
             return False
 
@@ -8910,117 +8682,125 @@ class AIAgent:
             )
         return transformed
 
-    def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
-        """Re-encode all native image parts at a smaller size to recover from
-        image-too-large errors (Anthropic 5 MB, unknown other providers).
+    def _tool_result_content_for_active_model(self, tool_name: str, result: Any) -> Any:
+        """Return the tool message content that is safe for the active model.
 
-        Mutates ``api_messages`` in place. Returns True if any image part was
-        actually replaced, False if there were no image parts to shrink or
-        Pillow couldn't help (caller should surface the original error).
-
-        Strategy: look for ``image_url`` / ``input_image`` parts carrying a
-        ``data:image/...;base64,...`` payload.  For each one whose encoded
-        size exceeds 4 MB (a safe target that slides under Anthropic's 5 MB
-        ceiling with header overhead), write the base64 to a tempfile, call
-        ``vision_tools._resize_image_for_vision`` to produce a smaller data
-        URL, and substitute it in place.
-
-        Non-data-URL images (http/https URLs) are not touched — the provider
-        fetches those itself and the size limit is different.
+        Multimodal tool results normally unwrap to OpenAI-style content parts so
+        vision-capable models can inspect screenshots.  Text-only providers must
+        not receive those image parts, because a rejected tool result becomes
+        part of the canonical history and can make the next user turn fail before
+        the agent has a chance to recover.
         """
-        if not api_messages:
-            return False
+        if not _is_multimodal_tool_result(result):
+            return result
 
-        try:
-            from tools.vision_tools import _resize_image_for_vision
-        except Exception as exc:
-            logger.warning("image-shrink recovery: vision_tools unavailable — %s", exc)
-            return False
+        content = result.get("content") or []
+        if not self._content_has_image_parts(content):
+            return content
 
-        # 4 MB target leaves comfortable headroom under Anthropic's 5 MB.
-        # Non-Anthropic providers we haven't observed rejecting are fine with
-        # much larger; shrinking to 4 MB here loses quality but only fires
-        # after a confirmed provider rejection, so the alternative is failure.
-        target_bytes = 4 * 1024 * 1024
-        changed_count = 0
-
-        def _shrink_data_url(url: str) -> Optional[str]:
-            """Return a smaller data URL, or None if shrink can't help."""
-            if not isinstance(url, str) or not url.startswith("data:"):
-                return None
-            if len(url) <= target_bytes:
-                # This specific image wasn't the oversized one.
-                return None
-            try:
-                header, _, data = url.partition(",")
-                mime = "image/jpeg"
-                if header.startswith("data:"):
-                    mime_part = header[len("data:") :].split(";", 1)[0].strip()
-                    if mime_part.startswith("image/"):
-                        mime = mime_part
-                import base64 as _b64
-
-                raw = _b64.b64decode(data)
-                suffix = {
-                    "image/png": ".png",
-                    "image/gif": ".gif",
-                    "image/webp": ".webp",
-                    "image/jpeg": ".jpg",
-                    "image/jpg": ".jpg",
-                    "image/bmp": ".bmp",
-                }.get(mime, ".jpg")
-                tmp = tempfile.NamedTemporaryFile(
-                    prefix="hermes_shrink_",
-                    suffix=suffix,
-                    delete=False,
+        if self._model_supports_vision():
+            # Vision-capable on paper — but if we've already learned in this
+            # session that the active (provider, model) rejects list-type
+            # tool content (e.g. Xiaomi MiMo's 400 "text is not set"),
+            # short-circuit to a text summary so we don't burn another
+            # round-trip relearning the same lesson.  Cache populated by
+            # the 400 recovery path in agent.conversation_loop.  Transient
+            # per-session; next session retries.
+            key = (
+                (getattr(self, "provider", "") or "").strip().lower(),
+                (getattr(self, "model", "") or "").strip(),
+            )
+            no_list = getattr(self, "_no_list_tool_content_models", None)
+            if no_list and key in no_list:
+                logger.debug(
+                    "Tool %s: model %s/%s known to reject list-type tool "
+                    "content this session — sending text summary",
+                    tool_name, key[0], key[1],
                 )
-                try:
-                    tmp.write(raw)
-                    tmp.close()
-                    resized = _resize_image_for_vision(
-                        Path(tmp.name),
-                        mime_type=mime,
-                        max_base64_bytes=target_bytes,
-                    )
-                finally:
-                    try:
-                        Path(tmp.name).unlink(missing_ok=True)
-                    except Exception:
-                        pass
-                if not resized or len(resized) >= len(url):
-                    # Shrink didn't help (or made it bigger — corrupt input?).
-                    return None
-                return resized
-            except Exception as exc:
-                logger.warning("image-shrink recovery: re-encode failed — %s", exc)
-                return None
+                return _multimodal_text_summary(result)
+            return content
 
+        summary = _multimodal_text_summary(result)
+        if tool_name == "computer_use":
+            return json.dumps({
+                "error": (
+                    "computer_use returned screenshot/image content, but the active "
+                    "model/provider does not support image input. Switch to a "
+                    "vision-capable model for desktop computer use, or use browser "
+                    "tools for browser tasks."
+                ),
+                "text_summary": summary,
+            })
+
+        logger.warning(
+            "Tool %s returned image content for non-vision model %s/%s; "
+            "falling back to text summary",
+            tool_name,
+            self.provider,
+            self.model,
+        )
+        return summary
+
+
+    def _try_shrink_image_parts_in_messages(self, api_messages: list) -> bool:
+        """Forwarder — see ``agent.conversation_compression.try_shrink_image_parts_in_messages``."""
+        from agent.conversation_compression import try_shrink_image_parts_in_messages
+        return try_shrink_image_parts_in_messages(api_messages)
+
+    def _try_strip_image_parts_from_tool_messages(self, api_messages: list) -> bool:
+        """Downgrade list-type tool messages to text summaries in-place.
+
+        Recovery path for providers that reject list-type tool message content
+        (e.g. Xiaomi MiMo's 400 "text is not set"; see issue #27344).  Walks
+        ``api_messages`` for any ``role: "tool"`` message whose ``content`` is
+        a list containing image parts, replaces the content with the existing
+        text part(s) (or a minimal placeholder if none survive), and records
+        the active (provider, model) in ``self._no_list_tool_content_models``
+        so subsequent ``_tool_result_content_for_active_model`` calls in this
+        session preemptively downgrade screenshots without a round-trip.
+
+        Returns True when at least one tool message was downgraded — the
+        caller (the 400 recovery branch in ``agent.conversation_loop``) uses
+        this to decide whether to retry the API call with the modified
+        history or surface the original error.
+        """
+        if not isinstance(api_messages, list):
+            return False
+
+        # Record (provider, model) so we don't relearn this lesson.
+        key = (
+            (getattr(self, "provider", "") or "").strip().lower(),
+            (getattr(self, "model", "") or "").strip(),
+        )
+        if not hasattr(self, "_no_list_tool_content_models"):
+            self._no_list_tool_content_models = set()
+        if key[1]:  # only record when we actually have a model id
+            self._no_list_tool_content_models.add(key)
+
+        changed = False
         for msg in api_messages:
-            if not isinstance(msg, dict):
+            if not isinstance(msg, dict) or msg.get("role") != "tool":
                 continue
             content = msg.get("content")
             if not isinstance(content, list):
                 continue
+
+            # Salvage any text parts so the model still sees some signal.
+            text_parts: List[str] = []
+            had_image = False
             for part in content:
                 if not isinstance(part, dict):
+                    if isinstance(part, str) and part.strip():
+                        text_parts.append(part.strip())
                     continue
                 ptype = part.get("type")
-                if ptype not in {"image_url", "input_image"}:
+                if ptype == "image_url" or ptype == "input_image":
+                    had_image = True
                     continue
-                image_value = part.get("image_url")
-                # OpenAI chat.completions: {"image_url": {"url": "data:..."}}
-                # OpenAI Responses: {"image_url": "data:..."}
-                if isinstance(image_value, dict):
-                    url = image_value.get("url", "")
-                    resized = _shrink_data_url(url)
-                    if resized:
-                        image_value["url"] = resized
-                        changed_count += 1
-                elif isinstance(image_value, str):
-                    resized = _shrink_data_url(image_value)
-                    if resized:
-                        part["image_url"] = resized
-                        changed_count += 1
+                if ptype in {"text", "input_text"}:
+                    text = str(part.get("text") or "").strip()
+                    if text:
+                        text_parts.append(text)
 
         if changed_count:
             logger.info(
@@ -9367,6 +9147,7 @@ class AIAgent:
             "openai/",
             "x-ai/",
             "google/gemini-2",
+            "google/gemma-4",
             "qwen/qwen3",
             "tencent/hy3-preview",
         )
@@ -9659,11 +9440,21 @@ class AIAgent:
 
         DeepSeek v4 thinking and Kimi / Moonshot thinking both reject replays
         of assistant tool-call messages that omit ``reasoning_content`` (refs
-        #15250, #17400).
+        #15250, #17400). Xiaomi MiMo thinking mode has the same requirement.
+
+        Result cached on the AIAgent instance keyed by (provider, model,
+        base_url); invalidated whenever ``switch_model()`` /
+        ``_try_activate_fallback()`` mutate any of those. This is hot — the
+        agent loop hits ~16 invocations per turn, each of which would
+        otherwise re-run ~5 ``base_url_host_matches`` (and therefore
+        ``urlparse``) calls under it. Caching drops the per-turn cost from
+        ~5us × 16 = ~80us to <1us.
         """
         return (
             self._needs_deepseek_tool_reasoning() or self._needs_kimi_tool_reasoning()
         )
+        self._thinking_pad_cache = (key, result)
+        return result
 
     def _needs_kimi_tool_reasoning(self) -> bool:
         """Return True when the current provider is Kimi / Moonshot thinking mode.
@@ -9671,6 +9462,12 @@ class AIAgent:
         Kimi ``/coding`` and Moonshot thinking mode both require
         ``reasoning_content`` on every assistant tool-call message; omitting
         it causes the next replay to fail with HTTP 400.
+
+        Detection is host-driven, not model-name-driven: aggregators like
+        OpenRouter that re-export Kimi/Moonshot models speak their own
+        protocol and reject ``reasoning_content`` echoes. We only enable the
+        kimi-reasoning replay when the request actually targets a
+        kimi/moonshot endpoint or the dedicated kimi-coding provider.
         """
         return (
             self.provider in {"kimi-coding", "kimi-coding-cn"}
@@ -9694,10 +9491,26 @@ class AIAgent:
             or base_url_host_matches(self.base_url, "api.deepseek.com")
         )
 
+    def _needs_mimo_tool_reasoning(self) -> bool:
+        """Return True when the current provider is Xiaomi MiMo thinking mode.
+
+        MiMo thinking mode requires ``reasoning_content`` on every assistant
+        tool-call message when replaying history; omitting it causes HTTP 400.
+        Refs: https://platform.xiaomimimo.com/docs/zh-CN/usage-guide/passing-back-reasoning_content
+        """
+        provider = (self.provider or "").lower()
+        model = (self.model or "").lower()
+        return (
+            provider == "xiaomi"
+            or "mimo" in model
+            or base_url_host_matches(self.base_url, "api.xiaomimimo.com")
+            or base_url_host_matches(self.base_url, "xiaomimimo.com")
+        )
+
     def _copy_reasoning_content_for_api(self, source_msg: dict, api_msg: dict) -> None:
-        """Copy provider-facing reasoning fields onto an API replay message."""
-        if source_msg.get("role") != "assistant":
-            return
+        """Forwarder — see ``agent.agent_runtime_helpers.copy_reasoning_content_for_api``."""
+        from agent.agent_runtime_helpers import copy_reasoning_content_for_api
+        return copy_reasoning_content_for_api(self, source_msg, api_msg)
 
         # 1. Explicit reasoning_content already set — preserve it verbatim
         # (includes DeepSeek/Kimi's own empty-string placeholder written at
@@ -9915,13 +9728,10 @@ class AIAgent:
     ) -> tuple:
         """Compress conversation context and split the session in SQLite.
 
-        Args:
-            focus_topic: Optional focus string for guided compression — the
-                summariser will prioritise preserving information related to
-                this topic.  Inspired by Claude Code's ``/compact <focus>``.
-
-        Returns:
-            (compressed_messages, new_system_prompt) tuple
+        ``force=True`` is passed by the manual ``/compress`` slash command
+        so users can bypass the summary-failure cooldown after an
+        auto-compress abort.  Auto-compress callers use the default
+        ``force=False``.
         """
         _pre_msg_count = len(messages)
         logger.info(
@@ -16310,6 +16120,18 @@ class AIAgent:
         result = self.run_conversation(message, stream_callback=stream_callback)
         return result["final_response"]
 
+    def _run_codex_app_server_turn(
+        self,
+        *,
+        user_message: str,
+        original_user_message: Any,
+        messages: List[Dict[str, Any]],
+        effective_task_id: str,
+        should_review_memory: bool = False,
+    ) -> Dict[str, Any]:
+        """Forwarder — see ``agent.codex_runtime.run_codex_app_server_turn``."""
+        from agent.codex_runtime import run_codex_app_server_turn
+        return run_codex_app_server_turn(self, user_message=user_message, original_user_message=original_user_message, messages=messages, effective_task_id=effective_task_id, should_review_memory=should_review_memory)
 
 def main(
     query: str = None,
@@ -16372,7 +16194,7 @@ def main(
             info = get_toolset_info(name)
             if info:
                 entry = (name, info)
-                if name in ["web", "terminal", "vision", "creative", "reasoning"]:
+                if name in {"web", "terminal", "vision", "creative", "reasoning"}:
                     basic_toolsets.append(entry)
                 elif name in [
                     "research",
