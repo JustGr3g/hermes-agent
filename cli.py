@@ -4984,8 +4984,12 @@ class HermesCLI:
                 thinking_callback=self._on_thinking,
                 checkpoints_enabled=self.checkpoints_enabled,
                 checkpoint_max_snapshots=self.checkpoint_max_snapshots,
-                checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
-                checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
+                # v0.15.2 dropped size-based checkpoint limits from
+                # AIAgent.__init__ (CheckpointManager keeps its own 500MB/10MB
+                # defaults, which equal Athena's config). Passing them here
+                # raised "unexpected keyword argument" and crashed every cron
+                # agent-init since the 2026-05-30 merge — including the daily
+                # summary cron, which then wrote no session/summary.
                 pass_session_id=self.pass_session_id,
                 skip_context_files=self.ignore_rules,
                 skip_memory=self.ignore_rules,
