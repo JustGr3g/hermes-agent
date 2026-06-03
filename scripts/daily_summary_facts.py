@@ -22,12 +22,14 @@ import json
 import os
 import re
 import sqlite3
+import subprocess
 import sys
 from collections import Counter
 from pathlib import Path
 
 HOME = Path.home()
 DB = HOME / "athena_memory.db"
+REPO = HOME / "cognitive-agent"
 ERROR_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "athena_server.error.log"
 GATEWAY_LOG = HOME / "cognitive-agent" / "hermes" / "logs" / "gateway.log"
 CRON_JOBS = HOME / "cognitive-agent" / "hermes" / "cron" / "jobs.json"
@@ -233,6 +235,15 @@ def gather() -> dict:
         # 0ms anchor-guard rejections, only 1 was a real subprocess failure.
         # Split them out so the summary distinguishes reliability from
         # proposer-quality signal.
+        # A "no-op" (added 2026-06-03) is a success=0 row where the tool DID
+        # run cleanly (returncode 0, real latency) but made no on-disk change
+        # — opencode_edit's "no file changes" outcome. Like an anchor
+        # rejection, it is not a tool-reliability failure: either the work was
+        # already present or the model declined to act. Counting these as
+        # failures minted the spurious "opencode_edit 100% failure" pattern +
+        # avoid-tool policy override. Kept separate from `rejected` so the
+        # narrative doesn't mislabel a clean no-op as an anchor rejection.
+        # The latency_ms >= 50 guard keeps it disjoint from `rejected`.
         rows = conn.execute(
             "SELECT tool_name, "
             "  SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, "
@@ -240,6 +251,10 @@ def gather() -> dict:
             "  SUM(CASE WHEN success=0 AND (latency_ms < 50 "
             "      OR error LIKE '%no concrete anchor%' "
             "      OR error LIKE '%anchor guard%') THEN 1 ELSE 0 END) AS rejected, "
+            "  SUM(CASE WHEN success=0 AND latency_ms >= 50 "
+            "      AND (error LIKE '%no file changes%' "
+            "        OR error LIKE '%no on-disk modification%') "
+            "      THEN 1 ELSE 0 END) AS no_op, "
             "  ROUND(AVG(CASE WHEN success=1 THEN latency_ms END), 1) AS avg_ok_ms "
             "FROM tool_outcomes WHERE timestamp >= ? "
             "  AND tool_name NOT LIKE 'synth:%' "
@@ -251,11 +266,13 @@ def gather() -> dict:
                 "tool": r[0],
                 "ok": r[1],
                 "fail": r[2],
-                # Genuine failures that actually ran the tool, vs pre-exec
-                # guard rejections. real_fail + validation_rejected == fail.
-                "real_fail": r[2] - r[3],
+                # Genuine reliability failures that actually ran the tool, vs
+                # pre-exec guard rejections vs clean no-ops.
+                # real_fail + validation_rejected + no_op == fail.
+                "real_fail": r[2] - r[3] - r[4],
                 "validation_rejected": r[3],
-                "avg_ms": r[4],
+                "no_op": r[4],
+                "avg_ms": r[5],
             }
             for r in rows
         ]
@@ -426,6 +443,41 @@ def gather() -> dict:
         try: conn.close()
         except Exception: pass
 
+    # ── Recently shipped code (git, last 48h) ──────────────────────────
+    # Added 2026-06-03. The morning summary kept (a) recommending features
+    # that already shipped and (b) the proposer kept minting goals to patch
+    # things Greg had just fixed by hand the night before (e.g. the 7-day
+    # self_improvement anchor, committed fd926e8 the evening before the cron
+    # flagged it as still-broken). Surfacing the recent commit log gives the
+    # summary LLM (and, downstream, the proposer's awareness) a cheap "what
+    # just landed" signal so it stops chasing already-done work. 48h window
+    # so an evening commit is still visible to the next-morning cron.
+    try:
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "log", "--since=48 hours ago",
+             "--no-merges", "--pretty=format:%h\x1f%ct\x1f%s"],
+            capture_output=True, text=True, timeout=15,
+        )
+        commits = []
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                if not line.strip():
+                    continue
+                parts = line.split("\x1f")
+                if len(parts) != 3:
+                    continue
+                sha, ct, subject = parts
+                try:
+                    ts = int(ct)
+                except ValueError:
+                    continue
+                commits.append({"sha": sha, "ts": ts, "subject": subject})
+        out["recent_commits_48h"] = commits[:40]
+        if proc.returncode != 0:
+            out["recent_commits_error"] = (proc.stderr or "").strip()[:200]
+    except Exception as e:
+        out["recent_commits_error"] = str(e)
+
     return out
 
 
@@ -445,6 +497,32 @@ def render_markdown(facts: dict) -> str:
         "table is `athena_notes` and `save_note` is the only correct write path."
     )
     lines.append("")
+
+    # Recently shipped — high-signal context placed early so it informs both
+    # the #4/#5 narrative and any code-modification goals the proposer emits.
+    commits = facts.get("recent_commits_48h")
+    if commits is not None:
+        lines.append("## Recently shipped code (git log, last 48h)\n")
+        if commits:
+            for c in commits:
+                lines.append(f"- `{c['sha']}` — {c['subject']}")
+            lines.append("")
+            lines.append(
+                "_These commits ALREADY LANDED on the working branch. Before "
+                "recommending a code change or proposing a code-modification "
+                "goal, check this list: do NOT recommend a feature that one of "
+                "these already implements, and do NOT propose patching a file a "
+                "commit here just changed (the edit will no-op and the goal "
+                "will suspend). If a recommendation overlaps a recent commit, "
+                "say 'already shipped in <sha>' instead._"
+            )
+        elif facts.get("recent_commits_error"):
+            lines.append(
+                f"- (error reading git log: {facts['recent_commits_error']})"
+            )
+        else:
+            lines.append("- (no commits in the last 48h)")
+        lines.append("")
 
     lines.append("## Cron jobs that exist\n")
     if facts.get("cron_jobs"):
@@ -524,26 +602,33 @@ def render_markdown(facts: dict) -> str:
         lines.append("")
 
     lines.append(
-        "## Tool fires — last 24h (ok / real_fail / anchor_rejected / avg latency)\n"
+        "## Tool fires — last 24h (ok / real_fail / anchor_rejected / no_op / avg latency)\n"
     )
     for t in facts.get("tool_fires_today", []):
         rej = t.get("validation_rejected", 0) or 0
+        nop = t.get("no_op", 0) or 0
         real = t.get("real_fail", t.get("fail", 0))
         seg = f"- {t['tool']}: ok={t['ok']} real_fail={real}"
         if rej:
             seg += f" anchor_rejected={rej}"
+        if nop:
+            seg += f" no_op={nop}"
         seg += f" avg_ok_ms={t['avg_ms']}"
         lines.append(seg)
     lines.append("")
     lines.append(
         "_**`anchor_rejected`** counts success=0 rows the dispatch/anchor "
         "guard rejected BEFORE running the tool (≈0ms) — almost always "
-        "opencode_run declining an abstract, anchorless prompt. These are "
-        "NOT reliability failures; they are a proposer-quality signal (a goal "
-        "with no concrete file/identifier to act on). Report reliability "
-        "using `real_fail` only, and mention `anchor_rejected` separately as "
-        "'abstract goals the anchor guard declined' — do NOT fold them into a "
-        "single 'X% failure rate' for the tool. `avg_ok_ms` is the latency of "
+        "opencode_run declining an abstract, anchorless prompt. **`no_op`** "
+        "counts success=0 rows where the tool ran cleanly but made no on-disk "
+        "change (opencode_edit's 'no file changes' — work already present, or "
+        "the model declined to act). NEITHER is a reliability failure: "
+        "`anchor_rejected` is a proposer-quality signal (no concrete "
+        "file/identifier to act on) and `no_op` is a model/prompt-quality "
+        "signal. Report reliability using `real_fail` ONLY, and mention "
+        "`anchor_rejected` / `no_op` separately — do NOT fold either into a "
+        "single 'X% failure rate' for the tool (doing so minted the bogus "
+        "'opencode_edit 100% failure' pattern). `avg_ok_ms` is the latency of "
         "successful runs only, so rejections don't deflate it._"
     )
     lines.append("")
