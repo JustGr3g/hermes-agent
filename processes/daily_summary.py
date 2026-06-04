@@ -237,20 +237,35 @@ class DailySummaryProcess(Process):
         return ProcessResult(status="ok", output=final_response)
 
 
+_AGENT_TIMEOUT_S = 900
+
+
 def _run_hermes_agent(prompt: str) -> tuple[bool, str]:
     """Run Hermes agent with a prompt via subprocess (standalone mode)."""
     try:
+        # `--quiet` (machine-readable path, cli.py:15236) is REQUIRED here.
+        # Plain `-q <prompt>` is the *human-facing* single-query path: it
+        # echoes `Query: <full_prompt>` to stdout, prints the "Initializing
+        # agent..." banner, and renders the styled response box. Because we
+        # capture stdout verbatim into final_response — which the scheduler
+        # delivers to Telegram — every one of those lines leaked into the
+        # daily summary (the full echoed prompt + facts became ~8 of the ~10
+        # delivered Telegram messages). `--quiet` suppresses the banner, the
+        # box, and the query echo; stdout becomes ONLY the agent's response
+        # (session_id + errors go to stderr, which we don't capture here).
+        # `-q` is still passed because `query = query or q` (cli.py:15047)
+        # supplies the message; `--quiet` only selects the clean output path.
         proc = subprocess.run(
-            ["hermes", "chat", "-q", prompt],
+            ["hermes", "chat", "-q", prompt, "--quiet"],
             capture_output=True,
             text=True,
-            timeout=300,
+            timeout=_AGENT_TIMEOUT_S,
         )
         if proc.returncode != 0:
             return False, proc.stderr.strip() or f"exit code {proc.returncode}"
         return True, proc.stdout.strip()
     except subprocess.TimeoutExpired:
-        return False, "Hermes agent timed out (300s)"
+        return False, f"Hermes agent timed out ({_AGENT_TIMEOUT_S}s)"
     except FileNotFoundError:
         return False, "hermes command not found in PATH"
     except Exception as e:
