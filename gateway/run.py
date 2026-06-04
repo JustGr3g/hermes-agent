@@ -15145,6 +15145,14 @@ class GatewayRunner:
                         if progress_lines:
                             progress_lines[-1] = f"{base_msg} (×{count + 1})"
                         msg = progress_lines[-1] if progress_lines else base_msg
+                    elif isinstance(raw, tuple) and len(raw) >= 1 and raw[0] == "__reset__":
+                        # Content-bubble marker: close off current progress bubble
+                        # and start fresh for any tool lines after.  This tuple
+                        # must not be appended to progress_lines as-is.
+                        # Skip the edit because there's nothing to send yet.
+                        await _roll_progress_overflow_if_needed()
+                        progress_lines.clear()
+                        continue
                     else:
                         msg = raw
                         progress_lines.append(msg)
@@ -16866,6 +16874,40 @@ class GatewayRunner:
                             "Failed to edit streamed message for session %s: %s",
                             session_key or "?", _edit_err,
                         )
+            elif _is_empty_sentinel and _sc is not None and _sc.message_id:
+                # Action-only turn (e.g. silent save_note, opencode_edit, or a
+                # model that returned no text after tool calls). Without a
+                # closure edit, the streaming placeholder ("⏳ Working — N min")
+                # stays on screen forever because every platform rejects empty
+                # edits (Telegram BadRequest; Slack/WhatsApp equivalents).
+                # Replace the placeholder with a one-line closure so the UI
+                # transitions out of the spinner state. Mirrors the
+                # non-streaming path's _normalize_empty_agent_response warning,
+                # tuned for the streamed case where the user has been staring
+                # at a heartbeat for a while.
+                _sc_msg_id = _sc.message_id
+                closure = (
+                    "✓ I finished the turn but didn't generate a visible "
+                    "reply. Send any message to continue."
+                )
+                try:
+                    await _sc.adapter.edit_message(
+                        chat_id=source.chat_id,
+                        message_id=_sc_msg_id,
+                        content=closure,
+                        finalize=True,
+                    )
+                    response["already_sent"] = True
+                    logger.info(
+                        "Closed empty-response placeholder for session %s "
+                        "(message_id=%s).",
+                        session_key or "?", _sc_msg_id,
+                    )
+                except Exception:
+                    logger.debug(
+                        "Empty-response closure edit failed for session %s "
+                        "(non-fatal)", session_key or "?", exc_info=True,
+                    )
 
         # Schedule deletion of tracked temporary progress bubbles after the
         # final response lands. Failed runs skip this so bubbles remain as

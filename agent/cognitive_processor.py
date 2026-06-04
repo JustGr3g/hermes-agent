@@ -341,6 +341,19 @@ class CognitiveProcessor:
                 "[ATHENA] trivial-input short-circuit: %r — skipping cog cycle",
                 msg_content[:60],
             )
+            # 2026-06-03: still persist a lightweight user episode so the
+            # conversation thread stays complete in episodic memory.
+            # Skipping the full cycle was always the optimization; losing
+            # the episode itself was an unintended side-effect that made
+            # trivial turns invisible to retrieval, /episodes, and any
+            # downstream consumer that reads conversation history.
+            try:
+                ca._store_trivial_user_episode(msg_content)
+            except Exception:
+                logger.debug(
+                    "[ATHENA] trivial-input episode persist failed",
+                    exc_info=True,
+                )
             return api_msg
 
         # Phase 3C: inject pre-compression context if this is a fresh session after compression

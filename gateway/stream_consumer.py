@@ -211,6 +211,20 @@ class GatewayStreamConsumer:
         finalize: bool = False,
     ):
         """Edit via the adapter, passing routing metadata when supported."""
+        # Empty-content guard. Every chat platform (Telegram, Slack, Matrix,
+        # WhatsApp, …) rejects edits with empty text — Telegram raises
+        # BadRequest("Message text is empty"), the rest fail similarly.
+        # Treating the empty edit as a no-op success lets the streaming loop
+        # advance without a traceback. The "agent finished with no visible
+        # reply" case is handled at the orchestration layer (run.py's
+        # _is_empty_sentinel closure edit), not here.
+        if not content or not content.strip():
+            logger.debug(
+                "stream_consumer: skipping edit with empty content "
+                "(message_id=%s, finalize=%s)", message_id, finalize,
+            )
+            from gateway.platforms.base import SendResult
+            return SendResult(success=True, message_id=message_id)
         kwargs = {
             "chat_id": self.chat_id,
             "message_id": message_id,
