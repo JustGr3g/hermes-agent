@@ -216,6 +216,7 @@ git add -A && git commit -m "feat: complete [feature name] implementation"
 - **Start code quality review before spec compliance is PASS** (wrong order)
 - Move to next task while either review has open issues
 - **Broad/investigative subagent tasks without a time budget.** A subagent asked to "validate 10 claims against code" will time out at 600s default. Either scope tasks to narrow claims (1-2 items each, ~5 minute work) or set `max_iterations=200` via the delegate_task parameters if broad coverage is required.
+- **Simple implementation tasks that trigger excessive file exploration.** A subagent asked to create a small standalone class (~50-100 lines) may burn 300+ API calls reading unrelated files it doesn't need. When the task's spec is complete (file paths, function signatures, test code all provided in context), **explicitly tell the subagent to minimize exploration and write the files directly**. Add this to every implementation task context: 'This task has a complete spec — you do not need to explore the codebase extensively. Write the implementation and tests directly, then run them.'
 - **Ship subagent audits without independent verification of critical claims.** Code-defaults-only findings are hypotheses, not facts. Ground every critical finding in live runtime state (a log line, a `grep`, a `ps` readout) yourself before reporting.
 
 ## Handling Issues

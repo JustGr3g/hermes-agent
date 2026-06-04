@@ -19,7 +19,8 @@ Metacognition    ─┘
 Each runs in a `_detect_*` method and returns `list[LearnedPattern]`:
 
 1. **`_detect_tool_failure_conditions`** — Per-tool failure rate >40% with >=5 samples -> pattern with confidence 0.5 + (fail_rate - 0.4)*0.5, capped at 0.95
-2. **`_detect_repeated_failure_chains`** — Tool failures within 10min preceding HIGH_FRUSTRATION/REPEATED_FAILURE signals -> "tool failures trigger stress"
+2. **`_detect_kind_failure_conditions`** — Per-kind failure rate >40% with >=5 samples across any tools sharing that kind (added May 31, Phase 5 domain transfer). Uses `_resolve_kind(tool_name)` callable wired from `ToolRegistry`. Condition format: `kind:<name>`. Cold-start: a new tool with 0 samples inherits its kind's failure pattern immediately.
+3. **`_detect_repeated_failure_chains`** — Tool failures within 10min preceding HIGH_FRUSTRATION/REPEATED_FAILURE signals -> "tool failures trigger stress"
 3. **`_detect_wm_overload_triggers`** — >3 tool calls in 2 minutes preceding WM_OVERLOAD -> pattern with density-based confidence
 4. **`_detect_strategy_mismatches`** — Critic lesson episodes (content starts with "Turn quality=") with `failed_strategies:` token -> patterns for strategies that degraded 2+ times
 
