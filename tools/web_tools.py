@@ -1333,3 +1333,124 @@ registry.register(
     emoji="📄",
     max_result_size_chars=100_000,
 )
+
+# ---------------------------------------------------------------------------
+# perplexity_search — standalone synthesis tool
+# ---------------------------------------------------------------------------
+# Routes through Perplexity Sonar (same provider as web_search when
+# search_backend=perplexity) but returns a richer shape: the LLM-synthesized
+# answer as a separate field plus structured source citations — not flat rows.
+# Budget: 5 calls/hour (vs 10/hr for web_search). Paid, ~5-8s latency.
+
+PERPLEXITY_SEARCH_SCHEMA = {
+    "name": "perplexity_search",
+    "description": "Search the web with Perplexity Sonar — returns a synthesized answer grounded in source citations. Use this over web_search when you need multi-source synthesis: comparing claims, summarizing a topic, researching current events or papers, fact-checking a specific claim, or deep investigation. NOT for one-word lookups, finding a single URL, or casual factual questions — use web_search for those. Budget: 5 calls/hour. Average latency: 5-8 seconds.",
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "The search query to research. Phrase as a question or topic for best synthesis results."
+            },
+            "limit": {
+                "type": "integer",
+                "description": "Maximum number of source citations to return. Defaults to 5, max 20.",
+                "minimum": 1,
+                "maximum": 20,
+                "default": 5
+            }
+        },
+        "required": ["query"]
+    }
+}
+
+
+def perplexity_search_tool(query: str, limit: int = 5) -> str:
+    """Search via Perplexity Sonar, returning answer + grounded sources.
+
+    Output shape::
+
+        {
+            "query": str,
+            "answer": str,               # Perplexity's synthesized response
+            "source_count": int,
+            "sources": [
+                {"title": str, "url": str, "snippet": str},
+                ...
+            ]
+        }
+    """
+    try:
+        limit = int(limit)
+    except (TypeError, ValueError):
+        limit = 5
+    limit = min(max(limit, 1), 20)
+
+    try:
+        from tools.interrupt import is_interrupted
+        if is_interrupted():
+            return json.dumps({"success": False, "error": "Interrupted"})
+
+        from agent.web_search_registry import (
+            get_active_search_provider,
+            get_provider as _wsp_get_provider,
+        )
+
+        backend = _get_search_backend()
+        provider = _wsp_get_provider(backend) if backend else None
+        if provider is None or not provider.supports_search():
+            provider = get_active_search_provider()
+
+        if provider is None:
+            return json.dumps({
+                "success": False,
+                "error": "No web search provider configured. Run `hermes tools` to set one up.",
+            })
+
+        logger.info("Perplexity search via %s: '%s' (limit: %d)", provider.name, query, limit)
+        response_data = provider.search(query, limit)  # normalized shape
+
+        if not response_data.get("success"):
+            return json.dumps(response_data)
+
+        rows = response_data.get("data", {}).get("web", [])
+
+        # Row 1 is the synthesized answer when Perplexity is the backend
+        answer = ""
+        if rows and rows[0].get("title") == "Perplexity Answer":
+            answer = rows[0].get("description", "")
+
+        # Rows 2..N are the source citations
+        sources = []
+        for row in rows[1:]:
+            sources.append({
+                "title": row.get("title", ""),
+                "url": row.get("url", ""),
+                "snippet": row.get("description", ""),
+            })
+
+        result = {
+            "query": query,
+            "answer": answer,
+            "source_count": len(sources),
+            "sources": sources,
+        }
+        return json.dumps(result, indent=2, ensure_ascii=False)
+
+    except Exception as e:
+        error_msg = f"Error in Perplexity search: {e}"
+        logger.debug("%s", error_msg)
+        return json.dumps({"success": False, "error": error_msg})
+
+
+registry.register(
+    name="perplexity_search",
+    toolset="web",
+    schema=PERPLEXITY_SEARCH_SCHEMA,
+    handler=lambda args, **kw: perplexity_search_tool(
+        args.get("query", ""), limit=args.get("limit", 5)),
+    check_fn=check_web_api_key,
+    requires_env=_web_requires_env(),
+    emoji="🔮",
+    max_result_size_chars=50_000,
+)
