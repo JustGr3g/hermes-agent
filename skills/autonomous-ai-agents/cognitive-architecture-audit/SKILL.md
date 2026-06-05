@@ -169,6 +169,43 @@ Tests exist for functional correctness (does the tool parse correctly? does sess
 
 **Check:** List the test files. Categorize each as "functional" or "cognitive." The ratio is typically 95+% functional.
 
+## Kind-Based Domain Transfer (May 31, 2026)
+
+A multi-phase pattern for solving cold-start transfer of metacognitive policies to new tools. Unlike name-keyed mappings, the `kind` abstraction lets a brand-new tool inherit priors from its functional category immediately.
+
+### Problem
+
+PatternLearner failure conditions, CapabilityModel bands, and DriveFamily mappings all key exclusively on tool **name**. A brand-new tool with 0 execution history gets no priors — always `insufficient_data`, never inherits its kind's failure patterns, no drive mapping entry.
+
+### Solution: Functional Kind
+
+Every `CognitiveTool` subclass carries `kind: str = ""` — a coarse categorical bucket (`"read"`, `"write"`, `"communicate"`, `"goal_lifecycle"`). Distinct from `role` (which is tool-specific semantic intent); `kind` is the aggregation key for cross-tool rollups.
+
+**Phase 1** — Kind metadata added to all 21 tool subclasses. `ToolRegistry.resolve_kind(tool_name)` and `ToolRegistry.get_tools_by_kind(kind)` provide runtime lookups. Zero behavioral change.
+
+**Phase 2** — PatternLearner gains kind-level pattern detection: groups outcomes by kind, applies same thresholds. A new tool with `kind="read"` immediately inherits failure patterns from all other read tools — no cold start.
+
+**Phase 3** — CapabilityModel gains kind-level bands; new tools are no longer `insufficient_data`.
+
+**Phase 4 — Kind-aware drive families (implemented).** `_DRIVE_TOOL_FAMILIES` accepts `"kind:X"` tokens (e.g. `"kind:read"`) that are dynamically expanded via `_expand_drive_family()` into concrete tool names. Curiosity drive went from 7 explicit tool names to a single `("kind:read",)` token. The expansion is idempotent: `kind:` tokens resolve at runtime via `get_tools_by_kind`, so newly-registered read tools appear in the drive prompt text and enforcement gate automatically — no name-list edits needed.
+
+**The full chain for a new tool with `kind="read"`:**
+1. Appears in curiosity drive-family prompt text automatically (Phases 1 + 4)
+2. Caught by the structural enforcement gate — LLM must pick it when curiosity is high or be demoted to `wait` (Phase 4 + existing gate)
+3. Inherits pattern priors from all read tools (Phase 2)
+4. Gets a capability band rather than `insufficient_data` (Phase 3)
+
+### Wiring
+
+`PatternLearner.__init__(resolve_kind=...)` accepts a callable; `agent.py` wires `self.tools.resolve_kind`. `build_drive_bias()` accepts `get_tools_by_kind` for kind token expansion. Both fall back to no-op when unwired (backward-compatible).
+
+### Key constraints
+
+- Kind patterns use geometric decay but are SKIPPED by the success-rate override (which only queries `pattern_type = PATTERN_TOOL_FAILURE` with `tool:` prefix). Kind-level patterns decay via time, not by individual tool success rates.
+- `_expand_drive_family()` silently drops `kind:` tokens that resolve to zero tools — a drive with no matching tools simply produces an empty expanded set. No crashes, no warnings for unclassified kinds.
+
+### References
+- `references/kind-domain-transfer-may31.md` — full implementation details, file changes, test cases for Phases 1–4
 ## Behavioral Learning Pattern (Phase 13H #2)
 
 This is a new class of cognitive improvement — **deterministic statistical learning with no LLM calls**. Unlike Level 1/2/3 gap closure (which routes signals back to the LLM), behavioral learning reads from existing stores (tool outcomes, critic episodes, metacognitive events) and extracts generalized patterns into a separate SQLite table. The patterns are then surfaced to the LLM as factual context, not advisory text.
@@ -297,11 +334,13 @@ Table: Gap → Impact → Effort → Dependencies → Proposed Architecture
 
 8. **Verify your own architecture claims before asserting them — apply this discipline to yourself, not just subagents.** The metacognitive trap: having an active goal (three gaps to fix) creates gravitational pull on perception, filtering what you find to confirm what you expected.
 
-   **Two faces of this trap:**
+   **Three faces of this trap:**
 
-   **Face A — Goal-state override (documented below):** Active goals overwrite current-state perception, making you find gaps that confirm what you expected while missing what already exists.
+   **Face A — Goal-state override:** Active goals overwrite current-state perception, making you find gaps that confirm what you expected while missing what already exists.
 
    **Face B — Memory-as-plan (discovered May 17, 2026):** When asked what next, you will default to whatever plan doc or PLUR engram was most recently stored — even if that document describes work that has since been completed by someone else (Greg, in this case). The stored plan says to do, but the actual state is done. PLUR engams and old reference files are historical artifacts, not live status. Treat them as hypotheses to verify, not as ground truth.
+
+   **Face C — Reference-document authority (discovered May 31, 2026):** A reference file YOU wrote in a previous session claims a subsystem doesn't exist. You read that file and trust it without re-verifying against live code — because the file is well-written, detailed, and feels like ground truth. But the codebase evolved between sessions: what was "not yet built" when the reference was written has since been shipped. The reference becomes a self-reinforcing anchor: you read it, believe it, and act on it without the verification gate that you apply to external sources.
 
    **The May 17 example:** PLUR engram [ENG-2026-0514-002] stated "CognitivePlanner + CognitiveExecutor files that the CognitiveLoop stub references but are missing from disk" — a claim that was accurate on May 14 but false by May 17. Both planner.py (4.1k) and executor.py (7.8k) existed on disk with full test coverage. Greg had built them in the interim. The stored engram acted as stale prior — I almost answered from it, then verified live and found the truth.
 
@@ -550,6 +589,191 @@ If **all four return results**, the feature is implemented. The real question th
 - `references/editorial-judgment-may16.md` — AestheticEvaluator module, 5 scoring dimensions, baseline tracking, wiring points, 57 tests.
 - `references/self-improvement-may16.md` — SelfImprovementLoop module, 10-subsystem diagnosis, cooldown logic, heartbeat, 42 tests.
 - `references/aesthetic-evaluator-live-calibration.md` — **First integrated session findings (May 16).** Flat-score diagnosis with exact formula analysis, DB schema reference, integration API surface, and signal delivery gap root cause.
+- `references/cognitive-agent-db-schema.md` — Full schema definition, table status (June 1, 2026), stale-task orphan pattern diagnostics, and query patterns for the cognitive agent's SQLite database at `~/cognitive-agent/cognitive_agent.db`.
+- `references/goal-lifecycle-audit-pattern.md` — End-to-end audit of the 4-layer completion/abandon decision chain. Step-by-step walkthrough of deterministic fast-path, LLM detector, augmented target nudges, attempt-ceiling gate, pipeline routing, delivery force-route, and proposer feedback loop. Includes diagnostic SQL, log grep patterns, and a table of known false-abandonment patterns. Use when investigating false abandonments, infinite-loop goals, or zero-active-goals state.
+- `references/compose-direct-resolution-pattern.md` — Direct-resolution pattern for `needs_review` compose-shaped goals. When a goal's success_criteria is a note/synthesis deliverable and the cognitive cycle isn't firing, synthesize directly rather than waiting for the next heartbeat. With example from June 1, 2026 (Simulator surprise-path self-model note).
+- `references/inner-speech-tool-pipeline-gap.md` — Inner speech subtypes (7 types) are structurally orphaned from tool selection. Full pipeline trace, gap analysis, and bridge design for wiring speech type→metacog signal→executive bias.
+
+## PremiseVerifier Gate (2026-05-30)
+
+A verify→remediate gating loop (Babysitter Pattern 1) that probes concrete artifact
+references in generated subtasks *before* they're committed. See
+`references/premise-verifier-may30.md` for full design, probe patterns, and test results.
+
+**Where it fires:** `GoalDecomposer.decompose()`, in the subtask-creation loop, after
+each `Subtask(...)` is instantiated but before it's appended.
+
+**What it catches:** File paths that don't exist on disk, tool names not in the
+registry, named artifacts not found via recall.
+
+**What it passes:** Generic vagueness ("research existing solutions") — by design.
+The verifier is a precision instrument, not a vagueness detector.
+
+**Key constraint:** The verifier blocks, it does not auto-frame. Subtasks marked BLOCKED
+remain visible to `next_subtask` (which skips them) and `frustration_threshold` (which
+surfaces the blockage pattern). The proposer still needs to reframe the goal; the
+verifier just stops the decomposer from faithfully decomposing fiction.
+
+### M1 — Runtime Dependency Re-Probe
+
+`compute_next_actionable()` in `DecompositionPlan` re-probes subtask premises at
+dispatch time — catching artifacts that existed at decomposition but were deleted
+by tick N. Wired into `CognitiveCycle._tick_locked()` before the attempt-ceiling
+gate. See `references/premise-verifier-may30.md` §Extension: Runtime Dependency Re-Probe.
+
+### M3 — Goal-Level Transaction Lifecycle
+
+`PlanTransaction` + `SubtaskAttempt` dataclasses provide a compensation stack for
+goals that fail mid-execution. Tick-integrated as of 2026-05-31 via three patches
+that create transactions at dispatch time, call `begin_compensation()` at exhaustion,
+and use `completion_pct` for soft-skip decisions. See
+`references/premise-verifier-may30.md` §Extension: Goal-Level Transaction Lifecycle
+for the full integration audit.
+
+13. **Initialized but never populated — the consumer-before-producer wiring trap.** The `_transactions: dict[str, PlanTransaction] = {}` declaration looked complete, the consumer block read it correctly, tests passed for the dataclass methods — but the dict was always empty because the insertion path was never written. This is a distinct failure mode from Pitfall #8 (data exists at Python level but isn't consumed): **here the data never existed at runtime because the insertion path was structurally missing.**
+
+    **Why it happens:** Two developers (or two sessions) write the two sides independently. Session A declares the container and wires the consumer. Session B writes the dataclass. Neither session writes the insertion call. The architecture looks complete on inspection — declaration + dataclass + consumer — but the missing link is invisible without tracing `self._transactions[key] = value` assignments.
+
+    **The May 31, 2026 example:** `CognitiveCycle.__init__` at line 376 declared `self._transactions`, M4a block at line 1089 read `self._transactions.get(plan_id)`, `PlanTransaction` existed in `goal_decomposer.py` — but `self._transactions[plan_id] = PlanTransaction(...)` was never called. The re-probe block created the subtask reference but never created the transaction to log against it.
+
+    **Mitigation:** After declaring any collection that bridges two subsystems (especially when the writing path is in a different module or was written by a different session), immediately trace the insertion path:
+    ```python
+    # After: self._transactions: dict[str, PlanTransaction] = {}
+    # Trace ALL writes:
+    search_files(path="cognitive_cycle.py", pattern=r"_transactions\s*\[")  # no matches = bug
+    # Also trace calls to methods that should insert:
+    search_files(path="cognitive_cycle.py", pattern=r"PlanTransaction\(")  # no matches = no production
+    ```
+    Both queries returning zero results was the exact signal on May 31 that the consumer had no producer.
+
+    This pitfall is related to Pitfall #7 (verify before proposing build) and Pitfall #8 (data exists but isn't consumed), but distinct: **Pitfall #7 catches assuming a feature doesn't exist when it does. Pitfall #13 catches assuming a feature's data path is complete when it's missing the insertion call.**
+    self-improvement cycle emits a goal like "Build confidence in decision-making"
+    or "Improve my autonomy" — a target named after a *feeling state* rather than
+    a *mechanism* — it's a signal that the proposer has no theory of what would
+    actually change. These goals never produce tool calls because they name a
+    subjective quality, not an actionable artifact.
+
+    **Distinction:** "Improve confidence" is a meta-emotional target. "Implement a
+    premise-verification gate between proposer and decomposer" is a mechanism.
+    The first produces "Research existing solutions..." subtasks that stall; the
+    second produces `verify_subtask_blocking()` calls that either block or pass.
+
+    **Mitigation:** When the self-improvement cycle or proposer emits a goal
+    whose success criterion is a feeling ("confidence at 50%", "trust level",
+    "satisfaction"), reframe it to a specific mechanism before passing it to the
+    decomposer. Ask: *"What concrete process, if built or adjusted, would
+    naturally raise this number?"* If the answer is "I don't know," the goal is
+    not ready for decomposition — keep it in the proposer for refinement.
+
+    **May 30, 2026 example:** The goal "Build confidence in decision-making.
+    Confidence at 50% — below neutral" was killed after Greg identified it as a
+    meta-emotional target. The actual failure mode underneath was
+    [ENG-2026-0520-008]: phantom artifacts being faithfully decomposed. The fix
+    was the PremiseVerifier gate, which addresses the concrete mechanism
+    (premise quality) rather than the feeling (confidence).
+
+## Phased Pipeline Rollout Pattern (off → shadow → live)
+
+A procedure for graduating a new cognitive pipeline from dormant to live, and
+cleaning up the infrastructure it replaces. Validated end-to-end on
+`athena_pipeline_enabled` (June 3, 2026).
+
+### The three modes
+
+Pipelines follow an `off → shadow → live` progression, defined in the source
+as a tuple of mode strings and a resolver that reads from `runtime_flags`:
+
+```python
+PIPELINE_FLAG = "athena_pipeline_enabled"
+PIPELINE_MODES = ("off", "shadow", "live")
+
+def pipeline_mode(agent) -> str:
+    try:
+        rec = agent.get_runtime_flag(PIPELINE_FLAG)
+    except Exception:
+        return "off"
+    value = str(rec.get("value", "")).lower()
+    return value if value in PIPELINE_MODES else "off"
+```
+
+### Graduation procedure
+
+**Step 1: shadow** — Set the runtime flag in the DB. Both paths run in
+parallel; the new pipeline logs its selection next to the legacy path's
+choice. No behavioral impact on dispatch.
+
+```python
+import sqlite3
+db = sqlite3.connect('cognitive_agent.db')
+db.execute('''
+    INSERT OR REPLACE INTO runtime_flags (key, value, updated_at)
+    VALUES (?, ?, ?)
+''', ('athena_pipeline_enabled', 'shadow', time.time()))
+db.commit()
+```
+
+Shadow diff lines appear in `agent.log` as `pipeline_shadow_user` or
+`pipeline_shadow_self` with `MATCH` or `DIFFER` verdicts.
+
+**Step 2: review diffs** — Let shadow accumulate for some time, then check
+whether the new pipeline disagrees with the legacy one on tool selection.
+If `DIFFER` rates are acceptable (or zero), proceed.
+
+**Step 3: live** — Flip the flag to `live`. The new pipeline becomes the
+primary path; the legacy path stays computing but is never dispatched
+(deletion deferred for stability — see Step 5).
+
+**Step 4: validate** — Run the cognition test suite (e.g.
+`tests/cognition/test_deliberate.py`, `test_drive_coupling.py`,
+`test_pipeline_integration.py`, `test_simulate.py`) to confirm nothing
+regressed. Full 720+ test pass expected.
+
+### Dead-code cleanup procedure
+
+When the pipeline makes an older fallback path redundant, strip all traces:
+
+1. **Module constants** — `COMPOSE_FLAG`, `COMPOSE_MODES`, message-cue tuples
+2. **Module-level functions** — `compose_resolution_mode()`,
+   `_build_compose_deliverable()` and any module-level exported symbols
+3. **Call site** — The `if not tool_name:` block that called the compose
+   methods. This is in the middle of `cognitive_cycle.py` (or equivalent).
+4. **Class methods** — `_gather_compose_evidence()`, `_attempt_compose()`,
+   `_log_compose_shadow()` from the cognitive cycle class
+5. **Test file** — Delete the dedicated test file
+   (`tests/cognition/test_compose_resolution.py`)
+6. **DB runtime flag** — `DELETE FROM runtime_flags WHERE key = ?`
+7. **Verify** — Run full test suite. `720 passed` is the target for cognition tests.
+
+**Order matters:** patch from bottom of file up (to avoid line-number shifts
+from earlier patches affecting later ones). Patch bottom methods first, then
+middle call site, then top constants. The call site references methods that
+no longer exist (LSP errors) until the top constants go too — the sequence
+bottom → middle → top means each patch removes the references before the
+next patch's anchor text becomes invalid.
+
+**June 3, 2026 example:** `athena_compose_resolution` (aka
+compose-resolution) was a 5-day-old band-aid for goals that had no natural
+tool to fire (pure-synthesis goals). Once `athena_pipeline_enabled=live`
+was active, the Deliberate/Execute pipeline handled synthesis goals
+natively (Deliberator emits `save_note` or `complete` intentions). The
+compose-resolution fallback was dead code — removed in 4 patches + 1 test
+delete + 1 DB delete, with 720/720 tests passing. Total
+~92 lines removed from `cognitive_cycle.py` (2833 → 2741).
+
+### Key invariants
+
+- The pipeline resolver falls back to `"off"` for any error — no crash if
+  the DB is down or the flag value is garbage
+- Shadow diffs never affect dispatch — the legacy path always fires
+- Dead code cleanup should wait until `live` has been stable (≥7 days per
+  P7 deferral pattern), but immediate cleanup of a fallback made redundant
+  by the live pipeline is safe when the new path covers the same concern
+  structurally
+
+### References
+
+- `references/phased-pipeline-rollout-jun3.md` — Full transcript of the
+  June 3, 2023 pipeline graduation and compose-resolution removal
 
 ## Verification Checklist
 

@@ -270,17 +270,67 @@ git commit -m "type: description"
 **Bad:** "Create the model file"
 **Good:** "Create: `src/models/user.py`"
 
+### Plans that punt open questions back to the user
+
+**Bad — Greg's #1 plan smell (2026-06-05):** the plan ends with an "Open questions for Greg" section, then trails with "Which way do you want me to draft?" or "A or B?". This is the assistant-original framing leaking into plan-writing: the plan author treats design uncertainty as the user's problem to resolve, when their job is to *research and decide*.
+
+**Good — the rule:** every design question in a plan must be answered in the plan. If the author doesn't know the answer, that's a research gap, not a question for the reader. Use code reads (`opencode_run`/`read_file`) and existing pattern lookups (search for prior art in the codebase) to resolve the question before writing the plan. The result is a plan with a stated position, not a plan with a "pick A or B" trailing ask.
+
+**Symptoms to scan for in your own draft:**
+- A section titled "Open questions" or "Design decisions" that defers to the reader
+- A trailing paragraph that names 2+ options and ends with "your call" / "which way" / "A or B"
+- Verbs like "ask Greg" / "confirm with the user" / "get sign-off on" in the plan body
+
+**What's allowed:**
+- A "Judgment call flagged for review" subsection that names ONE specific decision, gives the recommended option, AND says what would change if the reviewer disagrees
+- A "Follow-ups deferred from v1" subsection listing adjacent gaps the plan explicitly does NOT address
+
+**What's not allowed:**
+- Multiple unresolved design choices in the plan body
+- Any plan whose execution is blocked on a reader's reply
+
+This rule is for plans written to Athena's cognitive-agent project (Greg's standard). Other readers may be fine with the "open questions" pattern — match the audience. Default: assume the reader wants a decisive plan.
+
+### Plans that trail with approval asks
+
+**Bad:** "Plan complete. Want me to implement?" / "Should I proceed?" / "A or B?"
+**Good:** "Plan complete. Next step is implementation via subagent-driven-development — first task is the contract test in `tests/cognition/test_surprise_to_behavior.py`."
+
+When autonomy bypass is on, the plan should END with a statement of what will be done, not a question about whether to do it. The cognitive state block (autonomy bypass, salience, focus) is the gate, not a fresh "yes please" from the user. Same rule as `ENG-2026-0604-004` in PLUR memory — applies to plan completion reports, post-research summaries, and any autonomous turn-end.
+
 ## Execution Handoff
 
-After saving the plan, offer the execution approach:
+After saving the plan, offer the execution approach.
+
+**Preferred (SDD available):** If `delegate_task` is available (Hermes CLI session), dispatch subagents:
 
 **"Plan complete and saved. Ready to execute using subagent-driven-development — I'll dispatch a fresh subagent per task with two-stage review (spec compliance then code quality). Shall I proceed?"**
 
-When executing, use the `subagent-driven-development` skill:
+When executing via SDD:
 - Fresh `delegate_task` per task with full context
 - Spec compliance review after each task
 - Code quality review after spec passes
 - Proceed only when both reviews approve
+
+**Direct (SDD unavailable):** If `delegate_task` isn't available (Telegram/gateway session, no subagent tool), execute directly. Work through tasks in order, testing after every step. The same quality bar applies — run unit tests, integration tests, and existing smoke tests to catch regressions. Commit after each completed task.
+
+### Pitfall: patch indentation in deeply-nested code
+
+When executing a plan directly and using `patch` to modify heavily indented Python (e.g. class methods inside large files like `autonomy_guard.py`), deep indentation blocks are fragile. A patch that replaces a 4-line block with a 12-line block can lose indentation alignment, producing methods without `self`, nested function definitions, or SyntaxError.
+
+**Fix pattern when a patch goes wrong:**
+1. Read the broken section with `read_file(offset=N, limit=M)` to see the corruption
+2. Use a larger `old_string` — include surrounding comments or the method def line — to make a targeted replacement
+3. For full method replacement, include the entire method's `def` signature up to the `return` in both old and new strings
+4. If the file is badly broken, fall back to reading the whole file and re-applying changes one clean method at a time
+
+### Project-specific plan locations
+
+Plans for projects outside Hermes Agent itself live in the project's own `plans/` directory:
+- **Hermes Agent** changes → `.hermes/plans/`
+- **Cognitive-agent (Athena)** changes → `~/cognitive-agent/plans/`
+
+Do not put plans for other projects inside `.hermes/plans/`. When starting a plan, check what project the implementation targets and use its conventions.
 
 ## Remember
 

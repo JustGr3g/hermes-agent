@@ -92,3 +92,54 @@ docs/superpowers/*
 # also created in-repo when an agent operates in this checkout). Plans, audit
 # logs, and per-session caches are never artifacts of the codebase.
 .hermes/
+
+# ── Athena fork additions (2026-06-05): secrets, runtime state, databases ──
+# These keep credentials, runtime locks, large session/db artifacts, and a
+# stray in-repo copy of the parent project's package out of the backup repo.
+# Auth / credentials / channel + gateway state
+auth.json
+auth.lock
+gateway_state.json
+gateway.lock
+gateway.pid
+channel_directory.json
+channel_directory.json.bak*
+processes.json
+google_client_secret.json
+google_token.json
+# Databases (runtime state, never source)
+*.db
+*.db-shm
+*.db-wal
+# Runtime markers / per-tick locks
+.update_check
+.restart_last_processed.json
+.agentbus-removal-*.json
+cron/.tick.lock
+cron/output/
+cron/jobs.json.bak*
+# Provider/model caches (regenerated at runtime)
+context_length_cache.yaml
+models_dev_cache.json
+provider_models_cache.json
+ollama_cloud_models_cache.json
+# Large runtime dirs (sessions, language servers, caches, checkpoints, memory store)
+sessions/
+lsp/
+cache/
+checkpoints/
+memories/
+bin/
+# Stray in-repo copy of the parent project's package (not hermes source)
+/cognitive_agent/
+# Editor / backup files
+*.bak
+*.bak.*
+*.bak-*
+# Skill-runtime state (generated, not source)
+skills/.bundled_manifest
+skills/.curator_state
+skills/.usage.json
+skills/.usage.json.lock
+# Misc runtime state dir
+state/

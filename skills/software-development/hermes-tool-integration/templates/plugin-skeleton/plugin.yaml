@@ -1,0 +1,8 @@
+name: my_thing
+version: 0.1.0
+description: "Wraps the MyThing service. Replace this with what the tool actually does."
+author: Hermes Agent
+license: MIT
+kind: backend
+provides_tools:
+  - my_thing

@@ -69,6 +69,23 @@ for r in rows:
   3. YAML frontmatter-aware excerpting — skips `---` metadata blocks when building result excerpts
 - If tool-gap starvation re-emerges for a different tool, investigate the tool's invocation path (how does the CognitiveCycle call it? what parameters does the LLM dispatcher generate?) rather than the tool itself.
 
+### Pattern E: Telegram-Shaped Goal Drain (June 1, 2026)
+
+- **Symptoms:** 0 active goals despite proposer running. Recent self-proposed goals are concentrated in two outcome groups: (a) Telegram-shaped goals ("A Telegram to Greg about X...") abandoned at attempt ceiling 12 with 0–2 failures, and (b) calibration notes that complete in 1–3 attempts but produce artifacts nobody reads.
+- **Root cause:** The proposer generates Telegram-shaped goals regardless of whether `self_driven_telegram_enabled()` is set. When the Telegram flag is off (default), `send_message` is gated behind `SELF_DRIVEN_TOOL_GATED` in `cognitive_cycle.py`. The cycle correctly never fires `send_message`, the LLM selector cycles through available tools that can't deliver a message, and the goal abandons at 12 attempts.
+- **Why it drains the pipeline:** The proposer produces 1 goal per call. If the current proposal window's dominant drive produces a Telegram-shaped goal, that's the only slot for the next 240 min (rate-limiter staircase, Pattern B). The goal drains at 12 attempts (typically 12 min of tick time), and the pipeline is empty again until the proposal window reopens.
+- **Mitigation — proposer flag check:** In `propose_self_goal()`, before the LLM call, check `self_driven_telegram_enabled()`. If off, either:
+  1. Suppress Telegram-shaped proposals entirely by biasing the prompt toward `save_note`-shaped deliverables
+  2. Or append a directive: "Telegram flag is currently off — you CANNOT send messages. Frame any deliverable as a saved note instead."
+- **Deeper structural fix:** The proposer has no feedback loop from `self_goal_outcomes`. It keeps proposing shapes known to fail. Wiring the proposer to read recent outcome history before the LLM call would let it learn which shapes survive (see ENG-2026-0521-001 for the kimi-k2.6 model change that was the prior proposer fix).
+- **Query to detect:**
+  ```sql
+  SELECT content, status, attempt_count, failure_count, risk_tier
+  FROM goals WHERE source='self_proposed'
+  ORDER BY created_at DESC LIMIT 10;
+  ```
+  If Telegram-shaped goals dominate the abandoned list with attempt_count=12 and failure_count ≤2, this pattern is active.
+
 ## Recovery Paths
 
 ### Quick: Stuck-Cycle Fallback

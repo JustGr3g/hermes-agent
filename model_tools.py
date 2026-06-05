@@ -798,6 +798,17 @@ def handle_function_call(
             if block_message is not None:
                 return json.dumps({"error": block_message}, ensure_ascii=False)
 
+            # Pre-flight parameter validation — catches common mistakes
+            # (missing required params, bad enum values, non-existent paths)
+            # before the tool dispatches.
+            try:
+                from tools.tool_prevalidation import validate_tool_call
+                validation_msg = validate_tool_call(function_name, function_args)
+                if validation_msg is not None:
+                    return json.dumps({"error": validation_msg}, ensure_ascii=False)
+            except Exception as _val_err:
+                logger.debug("tool prevalidation error: %s", _val_err)
+
         # ACP/Zed edit approval runs before any file mutation.  The requester
         # is bound via ContextVar only for ACP sessions, so CLI/gateway paths
         # are unaffected when it is unset.

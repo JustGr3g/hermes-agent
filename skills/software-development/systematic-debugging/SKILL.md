@@ -21,7 +21,14 @@ Random fixes waste time and create new bugs. Quick patches mask underlying issue
 
 **Violating the letter of this process is violating the spirit of debugging.**
 
-> **Reference file:** `references/claim-verification.md` — protocol for independently verifying deployment claims against live runtime state. Use when someone tells you what changed in a running system.
+> **Reference files:**
+> - `references/premise-verification.md` — pre-subtask premise probes that catch phantom-artifact references before the cycle wastes attempts on nonexistent premises. Use when the cognitive cycle repeatedly fails on [ENG-2026-0520-008]-shaped phantom artifact goals, or whenever you're decomposing a goal that references concrete files/artifacts.
+> - `references/claim-verification.md` — protocol for independently verifying deployment claims against live runtime state. Use when someone tells you what changed in a running system.
+- `references/mixed-type-queue-dispatch.md` — pattern for handling signal tuples in async queue consumers. Use when `"\n".join(lines)` throws `TypeError: expected str instance, tuple found` in a stream pipeline.
+- `references/stale-pyc-bytecode-cache.md` — pattern for bugs that persist after source-fix because Python loaded old `.pyc` bytecode. Use when a fix exists in source but the running process still shows the old behavior.
+> - `references/preflight-tool-validation.md` — pre-flight parameter validation against JSON Schema to catch bad tool calls before dispatch. Use when the SelfImprovementLoop flags `tool_selection` or you observe a pattern of tool failures from bad parameters.
+> - `references/cross-repo-investigation.md` — patterns for cross-repo traces, one-line allowlist fixes, advisory-to-structural enforcement, and PLUR correction over deletion. Use when a feature gap spans two repos or a comment says "advisory, not enforced."
+> - `references/dirty-branch-cleanup.md` — scope check (git grep before reading diff) + 4-step pre-commit checklist for landing N uncommitted changes as isolated commits. Use when a feature branch has accumulated dirty files and you want to land them safely.
 
 ## The Iron Law
 
@@ -96,15 +103,31 @@ A classic failure mode: you read a `.py` file, see the fix, assume the fix is ac
 
 ### Crucial: Scoping — Check the Right Codebase
 
-In multi-agent systems (Hermes, Athena, Apollo, Remi), a tool referenced in one agent's registry may not exist in another's. **Always verify the exact codebase path** before concluding something is missing:
+In multi-agent systems (Hermes, Athena), a tool referenced in one agent's registry may not exist in another's. **Always verify the exact codebase path** before concluding something is missing:
 
 - Athena's tools live in `~/cognitive-agent/cognitive_agent/tools/`
 - Hermes' tools live in `~/cognitive-agent/hermes/tools/`
-- Apollo's tools live in `~/.hermes2/tools/`
 
 A claim like "read_vault is registered in the allowlist but doesn't exist" must be verified against the *same codebase* the autonomous loop uses. If Athena's `CognitiveAgent` registers `ReadVaultTool` via `cognitive_agent/agent.py:577`, the fact that it's absent from `hermes/tools/` is irrelevant — Athena's tool dispatcher uses `cognitive_agent/tools/registry.py`, not Hermes'. 
 
 Always trace the **actual dispatch path** (`from .tools.read_vault import ReadVaultTool` in imports, then `self.tools.register(...)`) before making a claim about tool registration.
+
+### Multi-Repo Cognitive Systems: Verify the Right Codebase
+
+Athena has components in at least two separate repos:
+- **cognitive_agent/** — the `CognitiveAgent`, cognitive_cycle, deliberation, memory subsystems
+- **hermes/** — the agent loop layer (`run_agent.py`), tool dispatch, platform adapters
+
+A feature gap you assume exists in one repo may already be implemented in the other. **Before declaring something missing, check both.**
+
+The diagnostic sequence that caught this (May 31 2026):
+1. Found a test (`tests/test_continuity.py`) importing from `hermes.agent.cognitive_processor`
+2. Assumed the compression capture was "partial" in cognitive_agent
+3. Read `hermes/run_agent.py:9761` — found `_last_pre_compress_state` capture was fully wired there
+4. Read `cognitive_processor.py:347` — found the injection was fully wired there too
+5. Both endpoints existed; the "gap" was an assumption
+
+**Rule:** When a test imports from a different repo, trace the actual implementation path in that repo before concluding the feature is incomplete. The test's import is a strong signal about where the real code lives.
 
 **Don't skip when:**
 - Issue seems simple (simple bugs have root causes too)
@@ -353,7 +376,34 @@ If you catch yourself thinking:
 
 **If 3+ fixes failed:** Question the architecture (Phase 4 step 5).
 
-### Silent Exception Swallowing — The Invisible Subsystem Trap
+## The Writeside Trap — Container reads return defaults while writes never fire
+
+A particularly subtle failure mode in Python codebases: a container (`dict`, `list`, in-memory cache) is **declared but never written to**. Every read returns a sane default (`.get()` returns `None`, `.get_or_create()` returns a fresh object), so there's no crash — but the integration is dead code.
+
+**Symptoms:**
+- A `.get()` on a dict always falls through to the `None` branch
+- A feature "works in tests" (tests inject the data directly) but never triggers in production
+- Logs show the read path executing but the "create if missing" path never fires
+- The dict appears in `__init__` but doing a `search_files` for `dict_name[key] = value` or `dict_name[key] = ` across the file returns zero hits
+
+**Detection pattern:**
+
+```python
+# 1. Verify container declaration
+read_file(path, offset=N, limit=5)  # e.g. self._transactions: dict[str, PlanTransaction] = {}
+
+# 2. Search for WRITE sites — NOT read sites
+search_files(path="target_file.py", pattern="dict_name[")   # find BOTH get() AND assignment
+# If only .get() / .get(key) appears, there's no write site.
+
+# 3. Check the READ site — does it defensively create?
+# If the read does .get(key) and returns on None without creating,
+# and step 2 shows no write site, the container is permanently empty.
+```
+
+**Real-world example discovered May 31, 2026:** `CognitiveCycle._transactions` was declared at line 376 (`self._transactions: dict[str, PlanTransaction] = {}`) and read at line 1089 (`tx = self._transactions.get(goal.id)`). Every tool execution called `.get()`, got `None`, and skipped the record_attempt block. The `PlanTransaction` integration was structurally dead. None of the three patch tasks (M4a, M4b, M4c) would have worked because the dict was never written to — the first patch that "creates a PlanTransaction on first subtask resolve" was hidden behind the assumption that M4a was already working.
+
+**The key insight:** An `.get()` that returns a safe default (None, empty list) is **indistinguishable from "data not ready yet"** unless you verify the write site. A plan that says "wire A into B" must check: does B actually have a path for data to enter it? If not, all downstream reads are phantom reads.
 
 A particularly insidious failure mode in Python codebases: **`except Exception:»pass` (or bare `except Exception:»return default`) that makes a subsystem silently invisible.**
 

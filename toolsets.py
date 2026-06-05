@@ -48,6 +48,10 @@ _HERMES_CORE_TOOLS = [
     "text_to_speech",
     # Planning & memory
     "todo", "memory",
+    # Athena cognitive-agent bridge (gated on port 8765 listening via check_fn
+    # in plugins/athena/__init__.py). Exposes state/cycle/audit/goals/prefer/halt
+    # as one tool with an action enum.
+    "athena",
     # Session history search
     "session_search",
     # Clarifying questions
@@ -444,6 +448,11 @@ TOOLSETS = {
             "skills_list", "skill_view", "skill_manage",
             # Planning & memory
             "todo", "memory",
+            # Athena cognitive-agent bridge — added 2026-06-04 to expose the
+            # local FastAPI surface (state/cycle/audit/goals/prefer/halt) as
+            # a single tool. No usage telemetry yet, but it's the entire
+            # reason this curated toolset exists.
+            "athena",
             # Session history search
             "session_search",
             # Code execution + delegation (both used)

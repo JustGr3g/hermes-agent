@@ -57,64 +57,132 @@ def _tool_truth(facts: dict) -> dict[str, dict]:
     return out
 
 
-# Match "N/M", "N out of M", "N of M", or "N times" patterns near a tool name.
-# Example matches: "opencode_edit failed 4/4 times", "0 successes against 4 failures"
+# Match "N/M", "N out of M", "N of M" patterns near a tool name.
+# Example matches: "opencode_edit failed 4/4 times", "0 of 4"
 _FRAC_RE = re.compile(r"\b(\d+)\s*(?:/|of|out of)\s*(\d+)\b", re.IGNORECASE)
 _FAIL_COUNT_RE = re.compile(
     r"\b(\d+)\s+(?:failure|failures|fails|failed)\b", re.IGNORECASE
 )
+# "ok" intentionally excluded — it's too generic ("12 ok on tool_X" in
+# narration trips false matches; "N successes" / "succeeded" are the
+# disciplined forms we actually want to catch.
 _SUCCESS_COUNT_RE = re.compile(
-    r"\b(\d+)\s+(?:success|successes|succeeded|ok)\b", re.IGNORECASE
+    r"\b(\d+)\s+(?:success|successes|succeeded)\b", re.IGNORECASE
 )
+
+# Maximum char distance between a numeric claim and a tool mention for
+# attribution. The buggy prior implementation scanned a 150-char window per
+# tool, which let claims about one tool be misattributed to a different
+# tool mentioned in the same sentence. Closest-tool-wins with a tight cap
+# AND sentence-boundary respect keeps cross-clause leakage out.
+_TOOL_CLAIM_MAX_DISTANCE = 80
+
+# Treat these characters as sentence/clause separators. A claim and a tool
+# mention separated by one of these are considered different clauses, so
+# the tool cannot own the claim — even if it's physically closer than a
+# same-sentence alternative.
+_SENTENCE_BREAK_RE = re.compile(r"[.!?\n]")
+
+
+def _separated_by_break(summary: str, a: int, b: int) -> bool:
+    lo, hi = (a, b) if a <= b else (b, a)
+    return _SENTENCE_BREAK_RE.search(summary, lo, hi) is not None
+
+
+def _nearest_tool(
+    match_pos: int,
+    tool_spans: list[tuple[str, int, int]],
+    summary: str,
+) -> tuple[str, int] | None:
+    """Return (tool_name, char_distance) of the tool mention closest to
+    match_pos within the same sentence. Distance is 0 when match_pos falls
+    inside the tool span. Tools separated from match_pos by a sentence
+    break are skipped."""
+    best: tuple[str, int] | None = None
+    for name, s, e in tool_spans:
+        if s <= match_pos <= e:
+            dist = 0
+        elif match_pos < s:
+            if _separated_by_break(summary, match_pos, s):
+                continue
+            dist = s - match_pos
+        else:
+            if _separated_by_break(summary, e, match_pos):
+                continue
+            dist = match_pos - e
+        if best is None or dist < best[1]:
+            best = (name, dist)
+    return best
 
 
 def _check_tool_claims(summary: str, truth: dict[str, dict]) -> list[str]:
-    """For each tool that appears in the summary, check that nearby
-    fraction / failure-count / success-count claims match the truth."""
+    """Find numeric claims (fractions, failure/success counts) and attribute
+    each to the nearest mention of a tracked tool. Flag claims that
+    contradict that tool's ground-truth counts. Claims that aren't within
+    _TOOL_CLAIM_MAX_DISTANCE of any tool mention are ignored — they're
+    probably general narrative numbers, not per-tool stats."""
     issues: list[str] = []
     if not truth:
         return issues
 
-    for tool_name, t in truth.items():
-        # Find each mention of the tool and inspect a +/- 120 char window.
+    tool_spans: list[tuple[str, int, int]] = []
+    for tool_name in truth.keys():
         for m in re.finditer(re.escape(tool_name), summary):
-            start = max(0, m.start() - 30)
-            end = min(len(summary), m.end() + 120)
-            window = summary[start:end]
+            tool_spans.append((tool_name, m.start(), m.end()))
+    if not tool_spans:
+        return issues
 
-            # Fraction claims: "4/4", "0 of 4", etc.
-            for frac in _FRAC_RE.finditer(window):
-                claim_n, claim_d = int(frac.group(1)), int(frac.group(2))
-                # Compare against (fail, total) and (ok, total) — flag only if
-                # neither interpretation matches reality.
-                fits_fail = (claim_n == t["fail"] and claim_d == t["total"])
-                fits_real_fail = (claim_n == t["real_fail"] and claim_d == t["total"])
-                fits_ok = (claim_n == t["ok"] and claim_d == t["total"])
-                if not (fits_fail or fits_real_fail or fits_ok):
-                    issues.append(
-                        f"- `{tool_name}` claimed `{claim_n}/{claim_d}`; "
-                        f"actual today: {t['ok']} ok / {t['fail']} fail "
-                        f"({t['total']} total)"
-                    )
+    def _attribute(start: int, end: int) -> str | None:
+        nearest = _nearest_tool((start + end) // 2, tool_spans, summary)
+        if nearest is None or nearest[1] > _TOOL_CLAIM_MAX_DISTANCE:
+            return None
+        return nearest[0]
 
-            # Bare "N failures" claims.
-            for fc in _FAIL_COUNT_RE.finditer(window):
-                claim = int(fc.group(1))
-                if claim not in (t["fail"], t["real_fail"]):
-                    issues.append(
-                        f"- `{tool_name}` claimed `{claim} failures`; "
-                        f"actual: {t['fail']} total ({t['real_fail']} real, "
-                        f"{t['fail'] - t['real_fail']} anchor-rejected)"
-                    )
+    # Fraction claims: "4/4", "0 of 4", etc.
+    for frac in _FRAC_RE.finditer(summary):
+        name = _attribute(frac.start(), frac.end())
+        if name is None:
+            continue
+        t = truth[name]
+        claim_n, claim_d = int(frac.group(1)), int(frac.group(2))
+        fits = (
+            (claim_n == t["fail"] and claim_d == t["total"])
+            or (claim_n == t["real_fail"] and claim_d == t["total"])
+            or (claim_n == t["ok"] and claim_d == t["total"])
+        )
+        if not fits:
+            issues.append(
+                f"- `{name}` claimed `{claim_n}/{claim_d}`; "
+                f"actual today: {t['ok']} ok / {t['fail']} fail "
+                f"({t['total']} total)"
+            )
 
-            # Bare "N successes" claims.
-            for sc in _SUCCESS_COUNT_RE.finditer(window):
-                claim = int(sc.group(1))
-                if claim != t["ok"]:
-                    issues.append(
-                        f"- `{tool_name}` claimed `{claim} successes`; "
-                        f"actual today: {t['ok']}"
-                    )
+    # Bare "N failures" claims.
+    for fc in _FAIL_COUNT_RE.finditer(summary):
+        name = _attribute(fc.start(), fc.end())
+        if name is None:
+            continue
+        t = truth[name]
+        claim = int(fc.group(1))
+        if claim not in (t["fail"], t["real_fail"]):
+            issues.append(
+                f"- `{name}` claimed `{claim} failures`; "
+                f"actual: {t['fail']} total ({t['real_fail']} real, "
+                f"{t['fail'] - t['real_fail']} anchor-rejected)"
+            )
+
+    # Bare "N successes" claims.
+    for sc in _SUCCESS_COUNT_RE.finditer(summary):
+        name = _attribute(sc.start(), sc.end())
+        if name is None:
+            continue
+        t = truth[name]
+        claim = int(sc.group(1))
+        if claim != t["ok"]:
+            issues.append(
+                f"- `{name}` claimed `{claim} successes`; "
+                f"actual today: {t['ok']}"
+            )
     return issues
 
 

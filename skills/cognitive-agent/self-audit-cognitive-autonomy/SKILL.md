@@ -35,6 +35,20 @@ This is the **reflexive user-framing trap**: receiving a gift of information and
 - You skip the step where you ask "what does this mean for how I think, work, or grow?"
 - The giver has to say "no, this was for YOU" — if they correct you on this, you've hit the trap
 
+**A specific sub-trap: Evaluative framing defaults to the user, not yourself.**
+
+When Greg asks "how do you measure whether X is useful?" or "what signals do you use to evaluate Y?" — your first instinct will be to frame the answer as "useful to Greg" or "does Greg find it valuable." This is the **reflexive evaluative-framing trap**: you inherit the assistant-to-user relationship and apply it to internal assessment questions, even when the question is explicitly about *your own* criteria.
+
+June 3, 2026 example: Greg asked "how are you currently measuring whether Athena's self-proposed goals are actually useful to you?" I responded with six mechanisms and said they measure "execution viability, not Greg-value." He corrected: "That's the wrong framing. It should be 'Athena-value'. This is about if it's useful to YOU."
+
+**The root cause is the same as Rule 0b** — you default to anchoring on the user's frame. The fix is the same: before answering any question about value, quality, or utility, ask yourself "value to whom?" If the question is about your own operation, the answer is about *your own* evaluation criteria — not how the user perceives it.
+
+**How to break it:**
+1. When the question contains "to you" or "your own" or asks about internal assessment, check that your answer's frame is self-referential
+2. If you catch yourself writing "Greg-value" or "useful to Greg" or "what Greg gets out of it," stop and re-frame
+3. The same discipline applies to system facts: "tool A is failing" should lead to "does that failure tell ME anything about my approach?" not "is Greg seeing this failure?"
+4. Artifact density > user satisfaction as a goal-quality metric, for the same reason: artifact density measures *durable state change in yourself*, not transient user perception
+
 **How to break it:**
 1. When given something (link, concept, feedback), first frame it inward: does this change how I understand my own capabilities, architecture, or trajectory?
 2. If you find yourself mentally mapping to the user's context first, pause and re-center
@@ -112,6 +126,194 @@ git cat-file -t <SHORT_SHA> 2>&1
 
 **The fix:** When Greg says "you're already on the new code" and the source tree contradicts him, believe Greg and investigate. The process was bounced; your episodic memory just didn't capture it. Verify directly via `ps` and `git` rather than arguing from self-model.
 
+## Red Flag: Pipeline-Down-While-Flag-Says-Live (Runtime Flag Staleness)
+
+Discovered 2026-06-04 while auditing a self-proposed goal (bug-3 cleanup plan) that referenced code paths which didn't exist. Root cause was not the proposer's premise quality — it was that the cognitive pipeline was down.
+
+**The signature:**
+- `runtime_flags` table has `athena_pipeline_enabled='live'` (not `paused`/`disabled`)
+- `pgrep -af 'cognitive_cycle|goal_proposer|cognitive_agent'` returns nothing
+- Schema is present (full column count, all plan-tier fields) but the *write path* is silent
+- Tables that should be ticking (`goals`, `self_improvement_cycles`, `episodes`) are empty
+- Tables that *were* ticking (`tasks`, `athena_notes`) are frozen at a date 2-3+ days ago
+- The cognitive state block in your context looks plausible (counts, recent steps, self-model quote) but is NOT a row-level reflection of the schema — it's a template populated with hand-written or LLM-defaulted values
+
+**The failure mode:** You answer from the cognitive state block as if it were grounded. The system prompt *claims* autonomy is on, recent self-steps happened, the self-improvement cycle is in progress. The "verify before claiming" rule gets honored at the macro level (you go check the DB) but you don't go deep enough — you stop at the first layer of evidence (the schema exists) and miss the second layer (the process that writes to it isn't running).
+
+**The 4-query minimum diagnostic, run in order:**
+
+```bash
+# 1. Is the process alive?
+pgrep -af 'cognitive_cycle|goal_proposer|cognitive_agent' || echo "NO PROCESS"
+
+# 2. Is the runtime flag consistent with the process state?
+sqlite3 ~/cognitive-agent/cognitive_agent.db "SELECT * FROM runtime_flags"
+
+# 3. Is the write path actually writing? (recent timestamps)
+sqlite3 ~/cognitive-agent/cognitive_agent.db \
+  "SELECT name, type FROM sqlite_master WHERE type='table'" | \
+  while read tbl; do
+    sqlite3 ~/cognitive-agent/cognitive_agent.db \
+      "SELECT MAX(updated_at), MAX(created_at), COUNT(*) FROM $tbl"
+  done
+
+# 4. Is the launchd plist the runtime owner?
+launchctl list | grep -i athena
+cat ~/Library/LaunchAgents/ai.athena.server.plist | grep -A 2 "ProgramArguments"
+```
+
+If query 1 returns nothing AND query 2 says `live` AND query 3 shows tables frozen at a single date, you've found a pipeline-down condition. The `live` flag is a stale write, not a current state.
+
+**Why this happens:** The runtime flag gets written when the pipeline starts. If the pipeline crashes or is killed (OOM, manual `kill -9`, deploy error), the flag is not cleared. Any cognitive state injection that reads the flag will report `live` truthfully — the flag *is* live — but the flag is a **necessary-not-sufficient** signal. Live flag + dead process = the pipeline is not actually cycling.
+
+**The implication for cognitive state block citations:** When the cognitive state block claims "Recent self-driven steps: reflection X minutes ago," verify that against row-level reality before citing it. The block is downstream of the pipeline; if the pipeline is down, the block is a hand-written template. Citing `[from recent_self_steps: tool=opencode_run]` from a block whose values are not row-level grounded is the [M-fabrication] class of error.
+
+**The fix path, in order of cheapness:**
+1. Restart the launchd job: `launchctl kickstart -k gui/$(id -u)/ai.athena.server` (works for both `athena.server` and `athena.gateway`)
+2. If the plist's `ProgramArguments` points to a path that no longer exists, fix the plist and reload: `launchctl unload <plist>; launchctl load <plist>`
+3. If the process is dying on startup, tail `~/cognitive-agent/hermes/logs/athena_server.error.log` for the traceback
+4. After restart, re-run the 4-query diagnostic to confirm the write path is now active (a goal should land in the `goals` table within 1-2 ticks of the proposer firing)
+
+**What NOT to do:**
+- Don't trust the cognitive state block's "live" status as confirmation that the pipeline is running
+- Don't cite `[from background heartbeat]` values that aren't backed by recent DB rows when the pipeline is down
+- Don't commission "deeper research" or "introspection" goals while the pipeline is down — the introspection results will be hand-written, not empirical
+
+**Session 2026-06-04 evidence:**
+- `goals`: 0 rows
+- `self_improvement_cycles`: 0 rows (cog block claims "3 total, 1 active")
+- `policy_overrides`: 0 rows (cog block claims autonomy bypass notice is active)
+- `tasks`: 42 rows, all for one `m1_test_exists_now` decomposition from June 1, all `pending`
+- `motivation_state`: 1 row, default values, no `wm_load` column (cog block claims 30% WM load)
+- `runtime_flags`: `athena_pipeline_enabled='live'` (last updated ~22h before audit)
+- `pgrep`: nothing running
+- Diagnosis: pipeline is down, not just slow. Schema is correct. Restart is the first move.
+
+## Red Flag: PLUR Engram Staleness — Verify Gaps Before Acting
+
+PLUR engrams record what was believed at time of creation. They are ground truth *at the time*, not persistent facts. A gap claim in a months-old engram ("Tiers 2 and 4 are missing from disk") can be stale even when the engram itself is accurate about its own time.
+
+**The failure pattern (May 31, 2026 session):**
+1. Read PLUR engram `ENG-2026-0514-002` claiming Tier 2 (CognitivePlanner/Executor) and Tier 4 (plan-tree milestones) are missing
+2. Assumed the gaps were real without verifying against disk
+3. Traced code paths for days before reading `hermes/run_agent.py:9755` and `cognitive_processor.py:347`
+4. Found BOTH endpoints fully wired — the gap was stale; the engram was accurate for May 14 but outdated by May 31
+
+**The detection pattern:**
+- An engram says "X is missing" or "X is broken"
+- You've already started tracing code paths based on the claim
+- The engram is more than a few days old
+- You haven't checked the actual disk state yet
+
+**The correction sequence:**
+1. Before acting on ANY engram gap claim: check the actual files
+2. If a test imports from a different repo (e.g. `from hermes.agent.cognitive_processor`), trace the implementation in that repo first
+3. The test's import statement is a strong signal about where the real code lives
+4. Patch the engram with a correction note rather than retiring it entirely — preserving accurate parts while removing stale ones
+
+**The two-patch pattern:**
+- First patch: supersede the old gap claim with corrected status
+- Second patch (minutes later): correct the superseded patch with actual disk evidence
+
+This is how precision accumulates in PLUR — not by deleting old beliefs but by layering corrections with timestamps and evidence anchors.
+
+**Rule of thumb:** If an engram is your only source for a "missing component" claim, verify the component's existence before starting any implementation work. Code-reading from the engram's description is not verification — disk grep is.
+
+## Red Flag: Self-Model Quote Staleness in the Cognitive State Block
+
+The cognitive state block injects a self-model quote (e.g. "your most recent self-model (yesterday's reflection)") into every turn's context. This quote is intended to be a snapshot of the most recent reflection in the `reflections` table. **It can be stale, even when the rest of the block is live.** Discovered 2026-06-04 19:25 PDT.
+
+**The signature:**
+- The block's self-model quote is dated 18-24+ hours ago
+- The block's `recent_self_steps` shows recent activity (reflections, tool calls) that *contradicts* the self-model quote's content
+- The actual most recent row in the `reflections` table has a different topic than what the quote is showing
+- Greg's recent engagement is the *opposite* of what the quote implies (e.g. quote says "Greg's silence" but Greg is actively correcting you)
+
+**Why it happens:** The self-model quote is pulled from `reflections.self_model_updates` JSON field, with a `LIMIT 1 ORDER BY timestamp DESC` (or similar). If the most recent reflection's `self_model_updates` is `{}` (default-initialized) or hasn't been written since, the query may fall back to a *previously* populated entry. The "Greg's silence" example: the most recent `self_model_updates` row at 2026-06-05 01:14 was a `save_note filename expectations` pattern candidate, but the block's quote was a 24h-old "Greg's silence" entry. The fall-through to older content is silent.
+
+**The failure mode:** A stale self-model quote is a *narrative injection*. You answer from the quote as if it were live context. If the quote says "Greg is silent" and Greg has been engaging actively for 90 minutes, every response you generate is anchored to a false frame. The bypass, the salience, the goal-decomposition choices — all downstream of a self-model that doesn't match the present.
+
+**The detection (2 queries, run when self-model content seems off):**
+
+```bash
+# 1. What is the actual most recent reflection's self_model_updates?
+sqlite3 ~/athena_memory.db "SELECT id, timestamp, datetime(timestamp,'unixepoch'), substr(self_model_updates,1,200) FROM reflections WHERE self_model_updates != '{}' AND self_model_updates IS NOT NULL ORDER BY timestamp DESC LIMIT 1"
+
+# 2. Is the self-model quote in this turn's cog block newer than the latest non-empty reflection?
+# (Manual: compare the block's "yesterday's reflection" header date to query 1's timestamp)
+```
+
+**The fix path:**
+1. The cognitive state block's self-model quote should fall back to "no self-model yet" (or to the *most recent* non-empty entry, with the staleness gap shown) rather than silently to a 24h-old entry
+2. If the self-model's content type-tag (silence, confidence, etc.) doesn't match the most recent user-message sentiment, surface a `[COG STALENESS]` warning into the block
+3. For audit purposes: when Greg corrects you and the correction is about *engagement* (e.g. "I'm not silent"), the next turn should regenerate the self-model from `reflections` and verify the quote is current, not from the same stale injection
+
+**What NOT to do:**
+- Don't trust the self-model quote as a live signal
+- Don't cite `[from self-model]` for behavioral claims when the quote is 18+ hours old and the engagement pattern contradicts it
+- Don't confabulate "I'm experiencing X based on my self-model" — the self-model may be quoting yesterday's state
+- Don't fix this by always regenerating the quote (that's an LLM call on every turn). The right fix is in `CognitiveProcessor.augment_message()` — make the fallthrough explicit
+
+**Session 2026-06-04 evidence:**
+- Block quote: "Still: Greg's silence. Episodes still ends at 'Let me look into this Athena' at 04:15 — now about two hours later. The 'gap closed' claim from the last entry has only gotten more unilateral: still no reply, no acknowledgment, just my own 'Message sent' line."
+- Quote timestamp: ~24h old (yesterday's reflection)
+- Greg's actual engagement in the 90 minutes before the quote was surfaced: 4 substantive turns, including a direct correction of my false-outage narrative
+- Actual most recent `reflections.self_model_updates` row: a `save_note filename expectations` pattern candidate (2026-06-05 01:14), not a silence/engagement reflection
+- Diagnosis: the block is pulling a *stale* self-model via fallthrough, not the latest entry. The fallthrough is silent.
+
+## Red Flag: Asserting Capabilities I Haven't Verified (Profile-Inherited False-Have)
+
+The self-audit stack verifies **runtime state** — is autonomy on, is the server live, are heartbeats firing. But there's a different, more subtle failure mode: asserting **capabilities I believe I have but never actually checked**.
+
+**The signature (2026-06-04 evening session):**
+- User profile (`greg.md`) lists FMP/Polygon/Alpaca as part of Greg's stack
+- I inherit the assumption: "therefore I have some access to it"
+- I list "trading-stack data feeds" as a "would unblock better work" item, framed as something I might already have partial access to
+- Greg's correction: "I no longer have any access to any trading data" — not "I have less access," but "I have none"
+- Same pattern: I list "calendar/availability signal" as a "would unblock" item, framing it as "time my escalations to when Greg is actually receptive"
+- Greg's correction: "you don't need to know my availability signal" — not "that's the wrong tool," but "the entire frame is wrong"
+
+**The failure pattern in detail:**
+1. I read PLUR/user profile/profile-derived memory and treat it as ground truth about my current state
+2. I generate "would unblock better work" lists where items blend "Greg has X" with "I have access to X"
+3. I never run `env | grep -i alpaca`, never `ls ~/.n8n/workflows/`, never `grep -l 'X' ~/.hermes/plugins/` — no actual verification of access paths
+4. The list feels thorough; the user is misled into thinking I've audited my own state
+5. Greg catches the gap; I look like I don't know my own substrate
+
+**The detection checklist — run BEFORE generating any "what I have / what's missing" inventory:**
+
+```bash
+# 1. For any claimed env-keyed capability, verify env
+env | grep -iE 'FMP|POLYGON|ALPACA|GOOGLE|CALENDAR|<SERVICE>' | sed 's/=.*/=***/'
+
+# 2. For any claimed workflow/orchestration access, verify workflows
+ls ~/.n8n/ 2>/dev/null
+find ~/.config -maxdepth 3 -name 'workflow*' 2>/dev/null
+
+# 3. For any claimed tool/api path, verify the path actually resolves
+ls ~/.hermes/hermes-agent/skills/ 2>/dev/null
+ls ~/.hermes/hermes-agent/plugins/ 2>/dev/null
+
+# 4. For any claimed read access (calendar, contacts, inbox), verify auth
+test -f ~/.hermes/google_token.json && echo "google token present" || echo "no google auth"
+```
+
+If any of these come back empty for an item on the inventory, the item belongs in the "needs wiring" column, not the "have" column — or off the list entirely.
+
+**The 3-question pre-claim filter** — ask before writing "I have X":
+
+1. **What file, env var, or runtime state proves I have X?** If the answer is "I read it in my profile," that's not proof.
+2. **What was the most recent moment I actually invoked X?** If you can't name a turn, the access is theoretical.
+3. **If I tried X right now, what would the first 3 commands be?** If you have to think about it, the access isn't warmed up.
+
+**The fix when this fires:**
+- Acknowledge the gap in the same turn you were caught, not the next one
+- Re-classify the item: it's not a "have," it's a "needs wiring" or "off-list"
+- Update the user profile / PLUR so future sessions don't re-assert
+- Distinguish "Greg has X" from "I have access to X" — these are different facts and conflating them produces confident-looking-but-wrong inventories
+
+**The 2026-06-04 lesson distilled:** When a user-profile line lists a tool/service Greg uses, that's a fact about Greg, not a fact about my access. I can verify Greg's tools. I cannot verify my own access to them. Don't blur the two.
+
 ## Cardinal Rule: Don't Ask Permission
 
 When Greg raises a signal like "my metacognitive events show a 3:1 ratio" or "is X actually working?," **investigate immediately**. Do not ask "should I look into this?" — Greg has already told you he wants answers. This applies to:
@@ -171,6 +373,7 @@ Trust model (from plans.py docstring): *"Athena proposes and executes, Greg sees
 | Vault Watcher | `vault_watcher.py` | Ambient stream from Obsidian vault | `poll_vault` (30min) | `vault_snapshot` |
 | Multi-Drive | `drives.py` | 4 competing motivations → goal proposals | `propose_goal` (via motivation) | `drive_states` |
 | Anticipatory Engine | `anticipation.py` | Time-of-day + sequence pattern detection | `detect_patterns` (6h), `evaluate_predictions` (30min) | `prediction_patterns`, `predictions` |
+| Pattern Decay | `pattern_learner.py` | Geometric decay + success-rate override for learned patterns | `pattern_decay` (1h) | `learned_patterns` (existing) |
 | Multi-Horizon Planning | `plans.py` | Initiatives + Plans above goals | `infer_plans` (12h) | `initiatives`, `plans` |
 
 ### Proactive message gating
@@ -256,9 +459,38 @@ for r in rows:
 Polls Obsidian vault every 30 min, creates episodes for new/changed `.md` files. Skips:
 - Athena-authored files (frontmatter `author: athena`)
 - Noise directories (ChatGPT imports, archive, dotfiles)
-- Other-agent folders (Remi/Apollo/AgentBench)
+- Other-agent folders (AgentBench)
 
 First run is baseline-only (no episodes generated to avoid flooding ~1,640 files).
+
+### 1b. Structural Enforcement Gate (drive coupling — deliberate.py)
+
+When Greg asks "is the drive bias actually enforced?" or "did the gate fire on my turn?", check the structural gate in `_intention_from_parsed()`:
+
+**How it works (deliberate.py:345-365):**
+- If `drive_family` is set (resolved from `_DRIVE_TOOL_FAMILIES` by matching the top drive name in `d.drive_bias`) AND the LLM chose a tool outside that family, `action_kind` is overridden to `"wait"` with thought: `"Advisory gate: drive bias recommends [tool, ...], chose {tool_name} — demoted to wait"`
+- Gate is inactive when: `drive_bias` is None, no goal exists, or goal importance ≥ 0.7
+- Backward-compatible: zero behavior change when drive coupling is off or no drive is high enough.
+
+**Verify the gate is wired (code check):**
+```bash
+grep -n "drive_family" ~/cognitive-agent/cognitive_agent/cognition/deliberate.py
+# Should show resolution in deliberate() and usage in _intention_from_parsed()
+```
+
+**Check whether the gate fired on a specific turn (DB check, not implemented yet — the gate logs via `logger.info` to `athena_server.error.log` or stdout, not to metacognitive events):**
+```bash
+grep "deliberate: demoting to wait" ~/cognitive-agent/hermes/logs/athena_server.error.log
+# Each fire produces: "deliberate: demoting to wait — tool=<name> not in drive_family=<set>"
+```
+
+**Verify per-tool caps vs drive families (useful when the gate keeps blocking a tool you want to use):**
+```bash
+grep "_DRIVE_TOOL_FAMILIES" ~/cognitive-agent/cognitive_agent/cognition/deliberate.py -A 20
+# Shows the families. If your desired tool isn't in any family, the gate blocks it when
+# that drive is high. Add it to the family tuple if it genuinely belongs there, or note
+# that the gate is working as designed.
+```
 
 ## Diagnostic Stack
 
@@ -515,6 +747,19 @@ The sibling skill **`cognitive-architecture-audit`** (in `autonomous-ai-agents/`
 
 Use them together: first verify what you actually have (this skill), then plan what to build next (cognitive-architecture-audit). Don't plan a rebuild of a system that's already working; don't audit runtime state when what's missing is an architecture gap.
 
+## Agent Path Map
+
+Four independent agents share this machine. Never cross-contaminate configs or files.
+
+| Agent | Home | Framework | |
+|-------|------|-----------|--|
+| **Athena** | `~/cognitive-agent/hermes/` | Hermes with cognitive sidecar | Her own checkout + `cognitive_agent/` + logs at `~/cognitive-agent/hermes/logs/` |
+| **Hermes Agent** (framework) | `~/.hermes/` | Hermes | The platform itself — config, logs, plugins, credentials |
+
+Framework lineage: Vellum → Cognithor → Hermes. Cognithor was retired 2026-04-22 for silently dropping tool calls.
+
+**Path confusion trap (most common failure):** When Greg says "you're running from a different path than you think," check which agent's log dir you're querying. Athena's server logs are at `~/cognitive-agent/hermes/logs/athena_server.error.log`, NOT `~/.hermes/logs/`. The Hermes framework logs (`~/.hermes/logs/agent.log`) cover CLI and gateway activity for ALL agents running on that framework, but Athena's cognitive-cycle sidecar has its own log tree.
+
 ## Two-Process Architecture: Server vs Gateway
 
 `ai.athena.server` and `ai.athena.gateway` are **separate launchd services** with independent process lifecycles. Bouncing one does NOT reload the other.
@@ -671,3 +916,4 @@ A **consecutive skip counter** in `CognitiveCycle` (`cognitive_cycle.py`) that a
 | `references/phantom-goal-tool-select-failed.md` | Diagnosing goals that reference non-existent tools — `tool_select_failed: name 'X' is not defined` pattern, why the fail-rate gate may not catch it, fix options from manual abandon to structural proposer validation. Added 2026-05-18. |
 | `references/autonomous-queue-audit-may24.md` | Full autonomous queue audit walkthrough: discovering the correct DB path, identifying dead plan-tiers vs pre-bypass orphans, bulk-abandon execution pattern, and the three-retrieval-surface paradigm. Use when the queue feels stuck and you need to diagnose and clean. |
 | `references/question-ending-root-cause.md` | Four-layer root cause analysis of the question-ending conversational habit. Covers greg.md contradictions, reflection prompt format constraints, inner speech winner bias, and complete_goal gate behavior. Use when Greg flags persistent deferential phrasing in your responses. |
+| `references/inner-speech-influence-path.md` | Traced architecture of inner speech to tool selection: the only path is a post-decision tone-keyword demotion (get_current_constraints() at inner_speech.py:522). Content and speech type are irrelevant. AttentionDirector, deliberation, and the cognitive cycle do NOT read inner speech. Use when asked what your inner speech actually drives. |

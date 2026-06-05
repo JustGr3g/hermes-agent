@@ -1,0 +1,7 @@
+name: athena
+version: 0.1.0
+description: "Structured wrapper for the Athena Cognitive Agent FastAPI surface (port 8765). Exposes state, cycle, audit, episodes, goals (list/create/complete/approve/reject/proposed), prefer, halt as one tool with an action enum."
+author: NousResearch
+kind: backend
+provides_tools:
+  - athena
