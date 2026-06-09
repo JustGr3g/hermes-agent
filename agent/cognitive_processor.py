@@ -558,19 +558,6 @@ class CognitiveProcessor:
                     f"— {phase}" + (f". {phase_hint}." if phase_hint else "")
                 )
 
-            # Phase 11A: persistent model of Greg — placed early in the
-            # block so the LLM sees who it's talking to before memories.
-            greg_excerpt = cog.get("greg_profile_excerpt", "") or ""
-            if greg_excerpt:
-                # Just the first ~600 chars to stay token-budget-friendly;
-                # full file is on disk if Athena ever needs deeper recall.
-                snippet = greg_excerpt[:600].rstrip()
-                lines.append("")
-                lines.append("Who you're talking to (Greg):")
-                for line in snippet.split("\n"):
-                    if line.strip():
-                        lines.append(f"  {line[:120]}")
-
             # Phase 11B: self-disclosure hint — when Athena's metacognition
             # fired a notable signal this turn AND the rate-limit allows,
             # tell the LLM to consider acknowledging it in the reply.
@@ -760,10 +747,6 @@ class CognitiveProcessor:
                 "they came from real file contents, not memory."
             )
             lines.append(
-                "- When using something from Greg's profile (greg.md), "
-                "cite [from greg profile]."
-            )
-            lines.append(
                 "- When stating something you don't have a source for, "
                 "say so explicitly (e.g. 'I'm not sure' or 'I'm guessing'). "
                 "Do not invent details."
@@ -789,8 +772,8 @@ class CognitiveProcessor:
                 "more than that block says, and don't claim less."
             )
             lines.append(
-                "- A citation tag (`[M#]`, `[P#]`, `[from greg "
-                "profile]`, `[from inner speech]`, `[from background "
+                "- A citation tag (`[M#]`, `[P#]`, `[from inner speech]`, "
+                "`[from background "
                 "heartbeat]`) is a CONTRACT: the cited source above "
                 "must actually contain the claim you're making. Do "
                 "NOT fabricate citations. If you can't pin a claim "
@@ -1390,7 +1373,6 @@ class CognitiveProcessor:
                     )
                 ),
                 "wm_summary": self._last_cog.get("wm", {}),
-                "greg_profile_excerpt": self._last_cog.get("greg_profile_excerpt", ""),
                 "self_disclosure": self._last_cog.get("self_disclosure", {}),
                 "time_context": self._last_cog.get("time_context", {}),
                 "autonomy_bypass": self._last_cog.get("autonomy_bypass", {}),
@@ -1426,7 +1408,6 @@ class CognitiveProcessor:
                 "aspirations": bridge.get("aspirations", []),
                 "metacognition": bridge.get("metacognition", {}),
                 "wm": bridge.get("wm_summary", {}),
-                "greg_profile_excerpt": bridge.get("greg_profile_excerpt", ""),
                 "self_disclosure": bridge.get("self_disclosure", {}),
                 "time_context": bridge.get("time_context", {}),
                 "autonomy_bypass": bridge.get("autonomy_bypass", {}),
