@@ -162,10 +162,14 @@ print('All smoke tests pass')
 
 1. **Threshold fires on every tick** — the remaining-cap check must use `cap - used`, not raw `used`. `used >= cap` is the deny gate; `remaining <= hits` is the notify gate.
 
-2. **Notification fires but Telegram doesn't** — check `_send_telegram is None` (guard was constructed without it). `_dispatch_threshold_notify` catches exceptions so a bad notifier never crashes the cycle.
+2. **Notification fires but Telegram doesn't** — check `_send_telegram is None` (guard was constructed without a notifier). `_dispatch_threshold_notify` catches exceptions so a bad notifier never crashes the cycle.
 
 3. **`bypass_active` not passed to `can_execute`** — when `autonomy_bypass=1`, the allowlist gate is widened. Omitting `bypass_active` silently blocks non-allowlist tools even under bypass.
 
 4. **Threshold blocks instead of advising** — the pattern is `if notify: dispatch(); continue`. Never `return` or `raise` from the threshold check.
 
 5. **`_threshold_hook` not wired** — motivation methods call `_fire_threshold_hook` which returns immediately if `_threshold_hook is None`. Always inject the hook after constructing `MotivationSystem`.
+
+6. **Trailing approval-ask in turn-end report** (recurring 2026-06-09 incident) — when a turn ends with a verified plan in hand (autonomy bypass active, decision = execute, the plan has a clear next action), the report should be action-shaped, not ask-shaped. Concretely: do NOT end a turn with "Want me to take option X?", "Should I proceed with Y?", or "is that ok?" patterns. The signal for next action lives in the cognitive state block (autonomy bypass, salience, focus, accumulated wins), not in a fresh "yes please" from the user. The correct close for a verified plan is a summary of what was done + a brief statement of what's queued, e.g. "Option A shipped. Options B and C still open if you want them." — declarative, no ask. This is enforced even on Telegram where the surface tempts toward chattier phrasing. If the plan is NOT verified (autonomy gate not open, decision = wait, no clear next action), the report can close with an open question — that's a different state.
+
+7. **The "but the next step is obvious" exception** is the trap. When the next step is obvious to the agent, it feels redundant to take it without asking. The framing: if the next step is obvious, the report saying "I'll take it next" IS the approval — Greg can stop you if not. If the next step is NOT obvious (genuinely irreversible, high-cost, or ambiguous), that's a different case and an ask is correct. Don't conflate the two.

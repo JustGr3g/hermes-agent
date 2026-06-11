@@ -486,6 +486,38 @@ Two call sites in `goal_proposer.py`:
 
 Both pass through `drives.record_proposal()` which handles the table name and column assignment.
 
+## Three-Layer Closure Pattern (2026-06-09 — Option A/B/C)
+
+The completion-detection fixes above all live in the **detector side** of the pipeline. When a goal cluster (e.g. 4+ goals of the same shape) keeps getting suspended with `attempt_count=0` (zero attempts), detector fixes alone don't help — the goal is *never dispatched*. The fix lives upstream, in three layers, applied in this order:
+
+**Layer 1 — Goal rewrite (Option A)**: For each suspended goal in the cluster, rewrite the `content` to use substrates that still exist. Update the goal via SQL or through `MotivationSystem` (preferred — fires the threshold hook). Then call `unsuspend_goal(gid, reason="...")` to flip status to `active` and clear `failure_count`. The cycle can now dispatch them.
+
+**Layer 2 — Proposer pre-flight gate (Option B)**: Add a `_gate_name(agent, content) -> Optional[str]` helper to `goal_proposer.py` that rejects new proposals referencing missing substrates. Wire it into the gate chain between `suspended_ancestry` and `telegram_rate_limit`. Conservative: use a small whitelist of token hints, exact-match-on-token-boundary, case-insensitive. The gate prevents *new* broken-dependency goals from entering the queue.
+
+**Layer 3 — Self-referential brief filter (Option C)**: For needs-review reporting surfaces, add a filter that demotes items whose deliverable is already on disk, and surface the count in a new section (e.g. "✓ Self-resolved (N)"). This breaks the self-reporting loop where the morning summary re-emits a prompt that the agent has already satisfied out-of-band.
+
+**Why all three?** Each layer fixes a different failure surface:
+- Layer 1 fixes the *symptom* (the 4 specific suspended goals)
+- Layer 2 fixes the *generator* (the proposer stops producing new instances)
+- Layer 3 fixes the *feedback loop* (the brief stops nagging about already-resolved items)
+
+A fix that ships only Layer 1 leaves the generator and the brief broken — the next tool removal or substrate shift will re-create the cluster. A fix that ships only Layer 2 leaves the existing backlog. A fix that ships only Layer 3 misclassifies unresolved items as resolved.
+
+**Trigger conditions for this pattern:**
+- Goal cluster size ≥ 3 with the same `suspend_count` and `attempt_count=0`
+- The cluster's content references a tool/path/identifier that no longer exists in the live substrate
+- A surface (brief, notification, daily summary) repeatedly emits the same unresolved prompt despite the underlying issue being addressed
+
+**Working example (2026-06-09 12:09-12:37):**
+- Symptom: 3 reflection-note self-proposals suspended on 2026-06-08 with `read_vault` declared; 76 total suspended goals in the queue
+- Layer 1: Rewrote 3 goals to use PLUR + episodes + inner-speech (no external tool), unsuspended via canonical `unsuspend_goal()` path → 3 active
+- Layer 2: Added `_unsupported_tool_dependency` gate with 17-entry `_TOOL_TOKEN_HINTS` whitelist, wired at line 1456 of `goal_proposer.py`. 9 new tests in `test_goal_proposer_unsupported_tool_dependency.py`. 35/35 proposer tests pass.
+- Layer 3: Added `_extract_note_path` + filter in `_query_needs_review` of `brief.py`. New `BriefData.self_resolved` field + renderer section. 13 new tests in `test_brief_self_referential_filter.py`. 37/37 brief tests pass.
+
+See `references/reflection-note-cluster-2026-06-09.md` for the full substrate query, the 12-goal family analysis, the diagnostic note path, and the verification steps.
+
+**Cost:** ~5-7 self-driven tool calls per layer (file reads, patches, test runs, .pyc clears), 30-40 minutes wall-clock per layer. Net 72/72 test pass rate, 0 regressions across both Option B and C test families.
+
 ## Key Diagnosis Lesson: Verify the Runtime Flag, Don't Assume
 
 The self-driven Telegram gate (`self_driven_telegram` runtime flag) was suspected as the bottleneck for Telegram-shaped goals hitting the attempt ceiling. **The flag was already `1` (ON)** [from sqlite3]. The real bottleneck was the LLM tool-selector never picking `send_message` across 10+ ticks of successful research.

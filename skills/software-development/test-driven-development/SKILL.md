@@ -279,6 +279,7 @@ Can't check all boxes? You skipped TDD. Start over.
 | Test too complicated | Design too complicated. Simplify the interface. |
 | Must mock everything | Code too coupled. Use dependency injection. |
 | Test setup huge | Extract helpers. Still complex? Simplify the design. |
+| Fixture pre-creates tables that a module owns | See [references/motivation-system-test-fixtures.md](references/motivation-system-test-fixtures.md) for the two-step pattern: pre-create only test-specific tables, let the module create its own via `_ensure_db()`. |
 
 ## Hermes Agent Integration
 

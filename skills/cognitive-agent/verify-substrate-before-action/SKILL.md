@@ -40,6 +40,7 @@ If any of those checks returns surprising state, **stop and ask** rather than pr
 - 'I added it to the core list, so it'll be visible' — wrong for curated toolsets. The curated list is the load-bearing allowlist.
 - 'I'll just write to config.yaml' — the patch tool will refuse. Don't burn a tool call discovering this.
 - 'Greg mentioned trading-stack access, so the keys are probably in env' — wrong. Verify, don't infer.
+- 'The import is inside `try/except Exception: pass`, so the missing symbol won't break anything' — wrong. The `try/except` protects against *runtime* `ImportError`. The **static** linter (Pyright, mypy) still flags the import as `unknown import symbol` at parse/analysis time, blocks code review, and surfaces in CI lint output. The two layers are independent. If the import is optional, use a string-based `importlib.import_module()` or a local type alias so the static analyzer doesn't try to resolve it. If it's required, fix the missing symbol.
 
 ## Verification: the 5-question preflight
 
