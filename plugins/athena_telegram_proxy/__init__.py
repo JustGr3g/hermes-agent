@@ -582,6 +582,220 @@ def _handle_full_restart(raw_args: str) -> Optional[str]:
 
 
 
+# ── /profile — Standard (Ollama) vs Power (Claude Max OAuth) ──────────────
+
+# Hermes conversation-layer settings per profile. Keep in sync with
+# cognitive_agent/model_profiles.py::CONVERSATION_LAYER — duplicated here
+# (two small dicts) instead of imported so the gateway process never
+# depends on cognitive_agent being importable.
+#
+# base_url is load-bearing: runtime_provider.py resolves provider
+# "anthropic" as `cfg_base_url or "https://api.anthropic.com"` — a stale
+# Ollama base_url left in config.yaml pointed the Anthropic client at
+# ollama.com and every Power-mode conversation fell back to minimax-m2.7
+# (observed live 2026-06-10 20:02). The built-in /model switch writes all
+# three keys on every change (gateway/run.py model_cfg["base_url"] =
+# result.base_url); this sync must do the same.
+_OLLAMA_FALLBACK_M3 = {
+    "provider": "ollama-cloud",
+    "model": "minimax-m3:cloud",
+    "base_url": "https://ollama.com/v1",
+    "key_env": "OLLAMA_API_KEY",
+}
+_OLLAMA_FALLBACK_M27 = {
+    "provider": "ollama-cloud",
+    "model": "minimax-m2.7:cloud",
+    "base_url": "https://ollama.com/v1",
+    "key_env": "OLLAMA_API_KEY",
+}
+_OLLAMA_FALLBACK_DEEPSEEK = {
+    "provider": "ollama-cloud",
+    "model": "deepseek-v4-flash:cloud",
+    "base_url": "https://ollama.com/v1",
+    "key_env": "OLLAMA_API_KEY",
+}
+
+# The fallback chain is per-profile: in Standard the primary IS minimax-m3,
+# so its first fallback is m2.7 (retrying the failed model would be
+# pointless). In Power the primary is Claude — when the Max usage window
+# is exhausted (Anthropic 400 "out of extra usage"), the right first
+# fallback is minimax-m3, the Standard primary, then the Standard chain.
+_PROFILE_CONVERSATION = {
+    "standard": {
+        "model": "minimax-m3:cloud",
+        "provider": "ollama-cloud",
+        "base_url": "https://ollama.com/v1",
+        "fallback_providers": [_OLLAMA_FALLBACK_M27, _OLLAMA_FALLBACK_DEEPSEEK],
+    },
+    "power": {
+        "model": "claude-opus-4-8",
+        "provider": "anthropic",
+        "base_url": "https://api.anthropic.com",
+        "fallback_providers": [
+            _OLLAMA_FALLBACK_M3,
+            _OLLAMA_FALLBACK_M27,
+            _OLLAMA_FALLBACK_DEEPSEEK,
+        ],
+    },
+}
+
+_PROFILE_SUMMARY = {
+    "standard": (
+        "conversation minimax-m3 · reasoning minimax-m3 · pipeline gemma4 "
+        "· vision ministral-3:14b"
+    ),
+    "power": (
+        "conversation opus-4.8 · reasoning sonnet-4.6 · pipeline haiku-4.5 "
+        "· vision haiku-4.5 (salience/micro-calls + opencode stay on Ollama)"
+    ),
+}
+
+
+def _anthropic_usage_lines() -> list:
+    """Claude Max window usage, best-effort. Empty list when unavailable."""
+    try:
+        from agent.account_usage import fetch_account_usage, render_account_usage_lines
+
+        snapshot = fetch_account_usage("anthropic")
+        if snapshot is None or not snapshot.available():
+            return []
+        return render_account_usage_lines(snapshot, markdown=True)
+    except Exception:
+        return []
+
+
+def _sync_hermes_conversation_layer(profile: str) -> bool:
+    """Point config.yaml model.default/provider/base_url and the
+    fallback_providers chain at the profile's conversation settings.
+    Returns True when the config actually changed."""
+    from hermes_cli.config import load_config, save_config
+
+    target = _PROFILE_CONVERSATION[profile]
+    cfg = load_config() or {}
+    model_cfg = cfg.setdefault("model", {})
+    fallbacks = [dict(fb) for fb in target["fallback_providers"]]
+    if (
+        model_cfg.get("default") == target["model"]
+        and model_cfg.get("provider") == target["provider"]
+        and model_cfg.get("base_url") == target["base_url"]
+        and cfg.get("fallback_providers") == fallbacks
+    ):
+        return False
+    model_cfg["default"] = target["model"]
+    model_cfg["provider"] = target["provider"]
+    model_cfg["base_url"] = target["base_url"]
+    cfg["fallback_providers"] = fallbacks
+    save_config(cfg)
+    return True
+
+
+def _handle_mode(raw_args: str) -> Optional[str]:
+    """/mode — show the active model profile; /mode power|standard
+    switches it: flips the runtime flag on the FastAPI server, repoints
+    the Hermes conversation model, then bounces both LaunchAgents (the
+    profile is read once at server startup by design).
+
+    Named /mode, not /profile: the gateway has a built-in /profile
+    (Hermes config-profile + home dir) that intercepts before plugin
+    commands — register_command would reject the collision."""
+    arg = (raw_args or "").strip().lower()
+
+    if not arg:
+        try:
+            resp = requests.get(f"{ATHENA_URL}/profile", timeout=10)
+            if resp.status_code != 200:
+                return f"(/profile error {resp.status_code}: {resp.text[:200]})"
+            data = resp.json()
+        except requests.exceptions.ConnectionError:
+            return "(Athena server is not reachable on :8765)"
+        except Exception as e:
+            return f"(/profile error: {e})"
+        profile = data.get("profile", "standard")
+        emoji = "⚡" if profile == "power" else "🦙"
+        lines = [
+            f"{emoji} *Model profile: {profile}*",
+            _PROFILE_SUMMARY.get(profile, ""),
+        ]
+        if data.get("restart_required"):
+            lines.append(
+                f"⚠️ Server still running the *{data.get('booted_with')}* "
+                "profile — restart pending (/full-restart applies it)."
+            )
+        usage = _anthropic_usage_lines()
+        if usage:
+            lines.append("")
+            lines.extend(usage)
+        lines.append("\nSwitch with `/mode power` or `/mode standard`.")
+        return "\n".join(line for line in lines if line is not None)
+
+    if arg not in _PROFILE_CONVERSATION:
+        return "Usage: `/mode` (status), `/mode power`, `/mode standard`."
+
+    # 1. Flip the runtime flag on the server. Abort the whole switch if
+    #    it's unreachable — never restart into an unknown state.
+    try:
+        resp = requests.post(
+            f"{ATHENA_URL}/profile", json={"profile": arg}, timeout=10
+        )
+        if resp.status_code != 200:
+            return f"(profile switch error {resp.status_code}: {resp.text[:200]})"
+        data = resp.json()
+    except requests.exceptions.ConnectionError:
+        return "(Athena server is not reachable on :8765 — profile unchanged.)"
+    except Exception as e:
+        return f"(profile switch error: {e})"
+
+    # 2. Repoint the Hermes conversation layer (config.yaml).
+    try:
+        config_changed = _sync_hermes_conversation_layer(arg)
+    except Exception as e:
+        return (
+            f"⚠️ Athena's flag is now *{arg}* but the Hermes config update "
+            f"failed ({e}). Fix config.yaml manually, then /full-restart."
+        )
+
+    already = (
+        data.get("previous") == arg
+        and not data.get("restart_required")
+        and not config_changed
+    )
+    if already:
+        return f"Profile *{arg}* is already active everywhere — no restart needed."
+
+    # 3. Bounce both LaunchAgents, same detached pattern as /full-restart:
+    #    reply flushes first, then the server re-reads the flag and the
+    #    gateway re-reads config.yaml.
+    uid = os.getuid()
+    cmd = (
+        "sleep 3 && "
+        f"launchctl kickstart -k gui/{uid}/ai.athena.server && "
+        f"launchctl kickstart -k gui/{uid}/ai.athena.gateway"
+    )
+    try:
+        subprocess.Popen(
+            ["/bin/sh", "-c", cmd],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            stdin=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+    except Exception as e:
+        return (
+            f"⚠️ Profile flag and config are set to *{arg}* but the restart "
+            f"failed to dispatch ({e}). Run /full-restart to apply."
+        )
+
+    conv = _PROFILE_CONVERSATION[arg]
+    emoji = "⚡" if arg == "power" else "🦙"
+    return (
+        f"{emoji} *Switching to the {arg} profile.*\n"
+        f"{_PROFILE_SUMMARY[arg]}\n"
+        f"Conversation layer → {conv['model']} ({conv['provider']}).\n"
+        "Restarting server (~5s) and gateway (~3s after) to apply. "
+        "In-memory cognitive state resets; SQLite stays intact."
+    )
+
+
 def _handle_athena(raw_args: str) -> Optional[str]:
     body = (raw_args or "").strip()
     if not body:
@@ -616,6 +830,16 @@ def register(ctx):
         handler=_handle_athena,
         description="Chat with Athena via her cognitive loop, or ping with no args.",
         args_hint="<message>",
+    )
+    ctx.register_command(
+        "mode",
+        handler=_handle_mode,
+        description="Show or switch Athena's model profile. /mode shows the "
+                    "active profile + Claude Max usage; /mode power routes "
+                    "cognition to Claude (Max subscription, no API billing); "
+                    "/mode standard restores the Ollama models. Switching "
+                    "restarts the server and gateway (~8s).",
+        args_hint="[power|standard]",
     )
     ctx.register_command(
         "full-restart",
