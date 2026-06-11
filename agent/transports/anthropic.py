@@ -88,7 +88,11 @@ class AnthropicTransport(ProviderTransport):
         from agent.transports.types import ToolCall
 
         strip_tool_prefix = kwargs.get("strip_tool_prefix", False)
-        _MCP_PREFIX = "mcp_"
+        # Single source of truth for the OAuth tool-name prefix — the
+        # adapter prefixes on send, this strips on receive. Was a local
+        # literal "mcp_" that silently diverged when the adapter's prefix
+        # changed to the Claude Code ``mcp__<server>__`` convention.
+        from agent.anthropic_adapter import _MCP_TOOL_PREFIX as _MCP_PREFIX
 
         text_parts = []
         reasoning_parts = []

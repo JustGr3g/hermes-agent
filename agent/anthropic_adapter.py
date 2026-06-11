@@ -316,7 +316,15 @@ def _detect_claude_code_version() -> str:
 
 
 _CLAUDE_CODE_SYSTEM_PREFIX = "You are Claude Code, Anthropic's official CLI for Claude."
-_MCP_TOOL_PREFIX = "mcp_"
+# Tool-name prefix injected on OAuth requests so tools look like Claude
+# Code MCP tools. MUST be the genuine Claude Code convention
+# ``mcp__<server>__`` (double underscores): as of 2026-06-10 Anthropic
+# 400s tool-bearing OAuth requests whose tools use the old bare ``mcp_``
+# prefix with "You're out of extra usage" (every model tier; the same
+# request with ``mcp__hermes__``-prefixed or unprefixed tools succeeds —
+# verified empirically against api.anthropic.com). normalize_response in
+# transports/anthropic.py imports this constant for the return-trip strip.
+_MCP_TOOL_PREFIX = "mcp__hermes__"
 
 
 def _get_claude_code_version() -> str:
