@@ -106,6 +106,96 @@ def _count_loglines(path: Path, date_prefix: str, pattern: str) -> int:
     return n
 
 
+# ── Verified-actions ledger (2026-06-11) ──────────────────────────────────
+# Port of the daily-reflection verified-actions gate (cognitive_agent/
+# messaging.py::_verified_actions_block) onto the live daily-summary
+# surface. The existing "Tool fires" section gives per-tool COUNTS but no
+# args, so the narrative LLM can write "I refactored the proposer" with no
+# args-level ground truth. `tool_outcomes` is the only record of what
+# actually ran — every firing writes a row — so this ledger is the complete
+# list of effect-producing actions in the window, and the rendered section
+# forbids any "I did X" claim not backed by an entry here (the recurring
+# morning-summary confabulation class — see feedback: verify her self-
+# reports).
+#
+# Read-only / inspection tools are excluded: they are never the subject of
+# an "I did X" accomplishment claim, and at ~90 fires/day they would bury
+# the real actions. SAFETY DIRECTION — when unsure whether a tool produces
+# an effect, leave it OUT of this set: its fires then still surface and the
+# gate never suppresses a true claim. Over-inclusion here = mild noise;
+# under-inclusion = a real action goes unlisted and the gate wrongly bars a
+# true "I've". Bias to inclusion.
+_NON_ACTION_TOOLS = frozenset({
+    "read_athena_vault",
+    "recall_memory",
+    "recall_hybrid",
+    "list_goals",
+    "list_self_tools",
+    "list_notes",
+    "list_tasks",
+    "get_goal",
+    "think",
+})
+
+_VERIFIED_ACTIONS_SAMPLES_PER_TOOL = 15
+
+
+def _build_verified_actions(rows: list[dict]) -> dict:
+    """Aggregate effect-producing tool_outcomes rows into a bounded ledger.
+
+    `rows` is a list of {tool_name, success, args_summary} dicts already
+    windowed by the caller. Read-only tools (`_NON_ACTION_TOOLS`) are
+    dropped and counted separately. Per tool we keep the distinct args
+    (deduped, capped) so the narrative LLM can see WHAT was saved/edited/
+    completed — the grounding the bare counts in `tool_fires_today` lack.
+
+    Pure function — no DB, no clock — so it is unit-testable in isolation,
+    mirroring messaging.py::_verified_actions_block.
+    """
+    by_tool: dict[str, dict] = {}
+    excluded = 0
+    for r in rows:
+        tool = r.get("tool_name") or "?"
+        if tool in _NON_ACTION_TOOLS:
+            excluded += 1
+            continue
+        slot = by_tool.setdefault(
+            tool,
+            {"tool": tool, "n": 0, "ok": 0, "fail": 0, "_args": [], "_seen": set()},
+        )
+        slot["n"] += 1
+        if r.get("success"):
+            slot["ok"] += 1
+        else:
+            slot["fail"] += 1
+        args = (r.get("args_summary") or "").replace("\n", " ").strip()[:140]
+        if args and args not in slot["_seen"]:
+            slot["_seen"].add(args)
+            slot["_args"].append(args)
+
+    out_tools = []
+    for _tool, slot in sorted(
+        by_tool.items(), key=lambda kv: kv[1]["n"], reverse=True
+    ):
+        distinct = slot["_args"]
+        samples = distinct[:_VERIFIED_ACTIONS_SAMPLES_PER_TOOL]
+        out_tools.append(
+            {
+                "tool": slot["tool"],
+                "n": slot["n"],
+                "ok": slot["ok"],
+                "fail": slot["fail"],
+                "samples": samples,
+                "more_distinct": max(0, len(distinct) - len(samples)),
+            }
+        )
+    return {
+        "total_effect_fires": sum(t["n"] for t in out_tools),
+        "excluded_read_fires": excluded,
+        "by_tool": out_tools,
+    }
+
+
 def gather() -> dict:
     """Pull every fact we can verify deterministically."""
     out: dict = {}
@@ -293,6 +383,33 @@ def gather() -> dict:
         ]
     except Exception as e:
         out["tool_fires_error"] = str(e)
+    finally:
+        try: conn.close()
+        except Exception: pass
+
+    # ── Verified-actions ledger (rolling 24h) ──────────────────────────
+    # The ground truth for "what Athena actually DID" — every tool firing
+    # records a tool_outcomes row, so this is the complete record of
+    # effect-producing actions. The rendered section (render_markdown)
+    # turns it into a hard ACTION CLAIMS gate over the narrative prose.
+    try:
+        conn = sqlite3.connect(DB)
+        win_start, _now = _rolling_24h_bounds()
+        rows = conn.execute(
+            "SELECT tool_name, success, COALESCE(args_summary,'') "
+            "FROM tool_outcomes WHERE timestamp >= ? "
+            "  AND tool_name NOT LIKE 'synth:%' "
+            "ORDER BY timestamp ASC",
+            (win_start,),
+        ).fetchall()
+        out["verified_actions"] = _build_verified_actions(
+            [
+                {"tool_name": r[0], "success": bool(r[1]), "args_summary": r[2]}
+                for r in rows
+            ]
+        )
+    except Exception as e:
+        out["verified_actions_error"] = str(e)
     finally:
         try: conn.close()
         except Exception: pass
@@ -638,6 +755,56 @@ def render_markdown(facts: dict) -> str:
         "tool executions. Do NOT describe them as 'failing tools' in the "
         "summary. See the next section if you want to talk about them._"
     )
+    lines.append("")
+
+    # ── Verified actions ledger — the ACTION CLAIMS gate ───────────────
+    va = facts.get("verified_actions") or {}
+    by_tool = va.get("by_tool") or []
+    total_actions = va.get("total_effect_fires", 0)
+    excl_reads = va.get("excluded_read_fires", 0)
+    lines.append(
+        "## Verified actions — last 24h (ground truth — the ONLY things you "
+        f"actually did): {total_actions}\n"
+    )
+    if by_tool:
+        for t in by_tool:
+            lines.append(
+                f"- **{t['tool']}**: {t['n']} fired (ok={t['ok']} fail={t['fail']})"
+            )
+            for s in t["samples"]:
+                lines.append(f"    • {s}")
+            if t.get("more_distinct"):
+                lines.append(f"    • …and {t['more_distinct']} more distinct")
+        lines.append("")
+        lines.append(
+            "**ACTION CLAIMS (hard rule):** every statement that you DID "
+            'something — "I edited…", "I saved…", "I completed…", "I sent…", '
+            '"I cleaned up…", "I fixed…" — MUST correspond to an entry above. '
+            "Each row is a real `tool_outcomes` firing; this is the COMPLETE "
+            "list of effect-producing actions in the window. Do NOT invent, "
+            "paraphrase, or aggregate an action that isn't here. If a topic "
+            'has no entry, write about it WITHOUT claiming you acted — use "I\'ll" '
+            '/ "I\'m going to", never the "I\'ve" stem. A `fail` row means the '
+            "action did NOT take effect — do not claim its result."
+        )
+        if excl_reads:
+            lines.append(
+                f"\n_({excl_reads} read-only / inspection fires — recall_memory, "
+                "read_athena_vault, list_* — are deliberately excluded above; "
+                "they are not 'I did X' actions, not omitted in error.)_"
+            )
+    else:
+        lines.append(
+            "**ACTION CLAIMS (hard rule):** you have NO recorded effect-"
+            "producing actions in this window. Do NOT claim you edited, saved, "
+            "sent, completed, fetched, or cleaned up anything — do NOT use the "
+            '"I\'ve" stem. Commit forward with "I\'ll" / "I\'m going to" instead.'
+        )
+        if excl_reads:
+            lines.append(
+                f"\n_({excl_reads} read-only / inspection fires occurred, but "
+                "none produced an effect — reads are not actions.)_"
+            )
     lines.append("")
 
     synth = facts.get("synth_markers_today", []) or []

@@ -90,13 +90,81 @@ def _seed_db(path: Path) -> None:
     conn.close()
 
 
+def _test_verified_actions_helper() -> None:
+    """Pure-function contract for the verified-actions ledger (2026-06-11).
+
+    Mirrors messaging.py::_verified_actions_block's role: tool_outcomes is
+    the only ground truth for what actually ran; read-only tools are
+    excluded; distinct args are kept (deduped, capped) so the gate can
+    back "I did X" prose.
+    """
+    rows = [
+        {"tool_name": "save_note", "success": True, "args_summary": "title='a'"},
+        {"tool_name": "save_note", "success": True, "args_summary": "title='a'"},  # dup
+        {"tool_name": "save_note", "success": False, "args_summary": "title='b'"},
+        {"tool_name": "send_message", "success": True, "args_summary": "to=greg"},
+        {"tool_name": "read_athena_vault", "success": True, "args_summary": "q=x"},
+        {"tool_name": "recall_memory", "success": True, "args_summary": "q=y"},
+    ]
+    va = dsf._build_verified_actions(rows)
+    # 2 read-only fires excluded, 4 effect fires counted.
+    assert va["excluded_read_fires"] == 2, va
+    assert va["total_effect_fires"] == 4, va
+    sn = next(t for t in va["by_tool"] if t["tool"] == "save_note")
+    assert sn["n"] == 3 and sn["ok"] == 2 and sn["fail"] == 1, sn
+    # Distinct args deduped: 'a' appears twice but listed once.
+    assert sn["samples"] == ["title='a'", "title='b'"], sn
+    # by_tool ordered by fire count desc (save_note=3 before send_message=1).
+    assert va["by_tool"][0]["tool"] == "save_note", va["by_tool"]
+
+    # Args truncation + dedup cap.
+    many = [
+        {"tool_name": "opencode_edit", "success": True, "args_summary": f"file=f{i}.py"}
+        for i in range(dsf._VERIFIED_ACTIONS_SAMPLES_PER_TOOL + 5)
+    ]
+    va2 = dsf._build_verified_actions(many)
+    oc = va2["by_tool"][0]
+    assert len(oc["samples"]) == dsf._VERIFIED_ACTIONS_SAMPLES_PER_TOOL, oc
+    assert oc["more_distinct"] == 5, oc
+
+    # Empty / all-reads case → no effect actions, reads counted.
+    va3 = dsf._build_verified_actions(
+        [{"tool_name": "recall_memory", "success": True, "args_summary": "q"}]
+    )
+    assert va3["total_effect_fires"] == 0 and va3["by_tool"] == [], va3
+    assert va3["excluded_read_fires"] == 1, va3
+
+
+def _test_action_claims_gate_renders(facts: dict) -> None:
+    """The rendered facts must carry the hard ACTION CLAIMS clause so the
+    gate travels with the data into the cron prompt."""
+    md = dsf.render_markdown(facts)
+    assert "Verified actions — last 24h" in md, "ledger header missing"
+    assert "ACTION CLAIMS (hard rule)" in md, "action-claims clause missing"
+    # The seeded DB has only opencode_run fires (an effect tool) → populated
+    # branch, which forbids the "I've" stem on unbacked claims.
+    assert 'never the "I\'ve" stem' in md, md[md.find("Verified actions"):][:800]
+    assert "opencode_run" in md[md.find("Verified actions — last 24h"):], "ledger row missing"
+
+
 def main() -> int:
+    # Pure-function contract first — no DB needed.
+    _test_verified_actions_helper()
+
     with tempfile.TemporaryDirectory() as td:
         db = Path(td) / "athena_memory.db"
         _seed_db(db)
         dsf.DB = db  # monkeypatch the module global
 
         facts = dsf.gather()
+
+        # Verified-actions ledger end-to-end: opencode_run fires are effect
+        # actions (3 rows: 1 ok, 2 fail), read-only excludes = 0 here.
+        va = facts["verified_actions"]
+        assert va["total_effect_fires"] == 3, va
+        oc_action = next(t for t in va["by_tool"] if t["tool"] == "opencode_run")
+        assert oc_action["ok"] == 1 and oc_action["fail"] == 2, oc_action
+        _test_action_claims_gate_renders(facts)
 
         # 1. Musing window: both last-evening fires counted, stale one dropped.
         assert len(facts["musing_fires_24h"]) == 2, facts["musing_fires_24h"]
