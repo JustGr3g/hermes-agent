@@ -1467,11 +1467,18 @@ class CognitiveProcessor:
         """Lazy-load all 8 cognitive systems. Idempotent — safe to call multiple times."""
         if self._initialized and self._systems.get("cognitive_agent") is not None:
             return
-        # Add cognitive_agent to path
-        cog_path = Path(__file__).parent.parent.parent / "cognitive_agent"
-        if str(cog_path) not in sys.path:
-            sys.path.insert(0, str(cog_path))
-
+        # NOTE: do NOT add cognitive_agent/ itself to sys.path. Putting the
+        # package's INNER directory on the path makes its flat modules
+        # shadow top-level names: `import agent` then resolves to
+        # cognitive_agent/agent.py instead of hermes' agent/ package, and
+        # every hermes-internal flat import (`from agent.x import`,
+        # `from tools.x import`) becomes a coin flip. This broke the Power
+        # profile on 2026-06-10: cognitive_agent.anthropic_client's
+        # `from agent.anthropic_adapter import ...` executed
+        # cognitive_agent/agent.py, whose relative import raised
+        # "attempted relative import with no known parent package" and
+        # latched the profile to Ollama. The project-root insert below is
+        # the correct (and sufficient) one.
         try:
             # Add project root to sys.path so cognitive_agent is importable as a package.
             # cognitive_agent/ is at ~/cognitive-agent/cognitive_agent/, project root
