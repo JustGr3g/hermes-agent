@@ -175,7 +175,11 @@ youtube = [
   "youtube-transcript-api==1.2.4",
 ]
 # `hermes dashboard` (localhost SPA + API).  Not in core to keep the default install lean.
-web = ["fastapi==0.133.1", "uvicorn[standard]==0.41.0"]
+# starlette pinned >=1.0.1 for CVE-2026-48710 (Host-header auth bypass);
+# fastapi aligned to the installed 0.136.1 (accepts starlette>=0.46) so the
+# security floor can't conflict on a fresh reinstall. Backported from v0.16.0
+# 2026-06-14 without the full framework upgrade (see plans/2026-06-14-hermes-*).
+web = ["fastapi==0.136.1", "uvicorn[standard]==0.41.0", "starlette>=1.0.1,<1.1"]
 all = [
   # Policy (2026-05-12): `[all]` includes only extras that genuinely
   # CAN'T be lazy-installed via `tools/lazy_deps.py` — i.e. things every
