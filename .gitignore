@@ -143,3 +143,4 @@ skills/.usage.json
 skills/.usage.json.lock
 # Misc runtime state dir
 state/
+.skills_prompt_snapshot.json

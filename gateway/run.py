@@ -103,7 +103,11 @@ _GATEWAY_AUTH_ERROR_RE = re.compile(
 )
 
 _GATEWAY_RATE_LIMIT_RE = re.compile(
-    r"(rate\s+limit|rate-limited|\b429\b|quota|usage\s+limit)",
+    # rate[\s_-]*limit covers "rate limit", "rate-limited", and provider
+    # error types like Anthropic's "rate_limit_error", which the previous
+    # whitespace-only pattern missed — 429s were falling through to the
+    # generic "failed after retries" bucket.
+    r"(rate[\s_-]*limit|\b429\b|quota|usage[\s_-]*limit|too\s+many\s+requests)",
     re.IGNORECASE,
 )
 
@@ -281,6 +285,13 @@ def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
     if _looks_like_gateway_provider_error(redacted):
+        # The user-facing reply says "check gateway logs for diagnostics" —
+        # make that true by recording what was rewritten (secrets already
+        # redacted above).
+        logger.warning(
+            "Gateway sanitized provider error in final reply; original (redacted): %s",
+            redacted,
+        )
         return _gateway_provider_error_reply(redacted)
     return redacted
 
@@ -297,6 +308,13 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
         return None
     if _looks_like_gateway_provider_error(text):
+        # Same diagnosability guarantee as the final-reply sanitizer: the
+        # replacement text points at the gateway logs, so log the original
+        # (secrets already redacted above).
+        logger.warning(
+            "Gateway sanitized provider error in status message; original (redacted): %s",
+            text,
+        )
         return _gateway_provider_error_reply(text)
     return text
 

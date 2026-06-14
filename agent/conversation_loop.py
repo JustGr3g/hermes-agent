@@ -1401,6 +1401,21 @@ def run_conversation(
                     # rather than retrying with extended backoff.
                     if agent._fallback_index < len(agent._fallback_chain):
                         agent._buffer_status("⚠️ Empty/malformed response — switching to fallback...")
+                    # Log the invalid response BEFORE eagerly switching — once
+                    # the fallback succeeds the buffered status trace is
+                    # discarded and the provider error (often a disguised 429,
+                    # e.g. Anthropic usage caps) is recorded nowhere.
+                    _resp_error = getattr(response, "error", None) if response is not None else None
+                    logger.warning(
+                        "%sEager fallback on invalid API response (attempt %s/%s): %s | provider=%s model=%s response.error=%s",
+                        agent.log_prefix,
+                        retry_count,
+                        max_retries,
+                        ", ".join(error_details) or "unknown",
+                        getattr(agent, "provider", "unknown"),
+                        getattr(agent, "model", "unknown"),
+                        str(_resp_error)[:300] if _resp_error else None,
+                    )
                     if agent._try_activate_fallback():
                         retry_count = 0
                         compression_attempts = 0
@@ -2683,6 +2698,21 @@ def run_conversation(
                             )
                         else:
                             agent._buffer_status("⚠️ Rate limited — switching to fallback provider...")
+                        # Log the classified error BEFORE eagerly switching —
+                        # this path bypasses the per-attempt "API call failed"
+                        # warning on later retries, and once the fallback
+                        # succeeds the buffered status trace is discarded, so
+                        # without this line the original 429/quota error is
+                        # recorded nowhere.
+                        logger.warning(
+                            "%sEager fallback on %s error: status=%s provider=%s model=%s summary=%s",
+                            agent.log_prefix,
+                            classified.reason.value,
+                            classified.status_code,
+                            getattr(agent, "provider", "unknown"),
+                            getattr(agent, "model", "unknown"),
+                            agent._summarize_api_error(api_error),
+                        )
                         if agent._try_activate_fallback(reason=classified.reason):
                             retry_count = 0
                             compression_attempts = 0

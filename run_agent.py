@@ -12775,6 +12775,25 @@ class AIAgent:
                             self._emit_status(
                                 "⚠️ Empty/malformed response — switching to fallback..."
                             )
+                        # Log the invalid response BEFORE eagerly switching —
+                        # once the fallback succeeds the status trace is
+                        # discarded and the provider error (often a disguised
+                        # 429, e.g. Anthropic usage caps) is recorded nowhere.
+                        _resp_error = (
+                            getattr(response, "error", None)
+                            if response is not None
+                            else None
+                        )
+                        logger.warning(
+                            "%sEager fallback on invalid API response (attempt %s/%s): %s | provider=%s model=%s response.error=%s",
+                            self.log_prefix,
+                            retry_count,
+                            max_retries,
+                            ", ".join(error_details) or "unknown",
+                            getattr(self, "provider", "unknown"),
+                            getattr(self, "model", "unknown"),
+                            str(_resp_error)[:300] if _resp_error else None,
+                        )
                         if self._try_activate_fallback():
                             retry_count = 0
                             compression_attempts = 0
@@ -13986,6 +14005,21 @@ class AIAgent:
                         if not pool_may_recover:
                             self._emit_status(
                                 "⚠️ Rate limited — switching to fallback provider..."
+                            )
+                            # Log the classified error BEFORE eagerly switching —
+                            # this path bypasses the per-attempt "API call failed"
+                            # warning on later retries, and once the fallback
+                            # succeeds the status trace is discarded, so without
+                            # this line the original 429/quota error is recorded
+                            # nowhere.
+                            logger.warning(
+                                "%sEager fallback on %s error: status=%s provider=%s model=%s summary=%s",
+                                self.log_prefix,
+                                classified.reason.value,
+                                classified.status_code,
+                                getattr(self, "provider", "unknown"),
+                                getattr(self, "model", "unknown"),
+                                self._summarize_api_error(api_error),
                             )
                             if self._try_activate_fallback(reason=classified.reason):
                                 retry_count = 0
