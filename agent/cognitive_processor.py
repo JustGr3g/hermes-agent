@@ -455,7 +455,27 @@ class CognitiveProcessor:
             meta = cog.get("metacognition", {})
             inner = cog.get("inner_speech", [])
 
-            lines = ["[ATHENA COGNITIVE STATE]"]
+            # [ATHENA] Constitution on the conversational path. PURPOSE.md
+            # governs the autonomous-loop/cron system prompts via
+            # run_agent.py / system_prompt.py — but the /chat reply path that
+            # serves her Telegram messages assembles context through THIS
+            # per-turn block, which was NOT carrying it (confirmed 2026-06-13:
+            # she could introspect this "cognitive state block" but reported
+            # no PURPOSE/SOUL — the earlier wiring was on a different path).
+            # The cog block is the reliable consumer for the conversational
+            # turn, so the constitution rides at its head: identity before
+            # transient state. Single source of truth (system_prompt_layer
+            # reads PURPOSE.md); empty-safe — no-op if the file is missing.
+            lines = []
+            try:
+                from cognitive_agent.purpose import constitution_block
+                _constitution = constitution_block()
+                if _constitution:
+                    lines.append(_constitution)
+                    lines.append("")
+            except Exception:
+                logger.debug("[ATHENA] constitution layer unavailable", exc_info=True)
+            lines.append("[ATHENA COGNITIVE STATE]")
 
             # Phase 13G: autonomy bypass banner — most important state to
             # surface, so it goes near the top. When on, every self-proposed

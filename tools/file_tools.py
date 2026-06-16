@@ -1117,12 +1117,42 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         return tool_error(str(e))
 
 
+def _athena_default_search_root() -> str:
+    """[ATHENA] Default search root spanning BOTH the vendored hermes fork
+    (HERMES_HOME) and the outer cognitive_agent/ tree + PURPOSE.md at the
+    repo root.
+
+    search_files' bare '.' resolves against cwd, which for Athena's
+    tool-running process is HERMES_HOME (~/cognitive-agent/hermes) — so '.'
+    silently excluded everything one level up. 2026-06-13: Athena ran
+    `search_files PURPOSE.md`, got nothing, and concluded the file didn't
+    exist — it lives at the repo root (her parent), where the constitution
+    LOADER already looks via get_hermes_home().parent. This realigns search
+    with that vantage. Only remaps for the Athena install (parent has
+    PURPOSE.md or cognitive_agent/); returns '.' otherwise (no behavior
+    change for generic Hermes). Survival-grep on upgrade: PURPOSE.md.
+    """
+    try:
+        hh = os.environ.get("HERMES_HOME")
+        if hh:
+            root = Path(hh).parent
+            if (root / "PURPOSE.md").exists() or (root / "cognitive_agent").is_dir():
+                return str(root)
+    except Exception:
+        pass
+    return "."
+
+
 def search_tool(pattern: str, target: str = "content", path: str = ".",
                 file_glob: str = None, limit: int = 50, offset: int = 0,
                 output_mode: str = "content", context: int = 0,
-                task_id: str = "default") -> str:
+                task_id: str = "default", include_ignored: bool = False) -> str:
     """Search for content or files."""
     try:
+        # [ATHENA] Widen the default root: bare '.' (cwd = HERMES_HOME) blinded
+        # her to the outer repo + PURPOSE.md. Explicit paths are respected.
+        if path in (".", "", None):
+            path = _athena_default_search_root()
         offset, limit = normalize_search_pagination(offset, limit)
 
         # Track searches to detect *consecutive* repeated search loops.
@@ -1162,7 +1192,8 @@ def search_tool(pattern: str, target: str = "content", path: str = ".",
         file_ops = _get_file_ops(task_id)
         result = file_ops.search(
             pattern=pattern, path=path, target=target, file_glob=file_glob,
-            limit=limit, offset=offset, output_mode=output_mode, context=context
+            limit=limit, offset=offset, output_mode=output_mode, context=context,
+            include_ignored=include_ignored
         )
         if hasattr(result, 'matches'):
             for m in result.matches:
@@ -1285,7 +1316,7 @@ PATCH_SCHEMA = {
 
 SEARCH_FILES_SCHEMA = {
     "name": "search_files",
-    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.",
+    "description": "Search file contents or find files by name. Use this instead of grep/rg/find/ls in terminal. Ripgrep-backed, faster than shell equivalents.\n\nContent search (target='content'): Regex search inside files. Output modes: full matches with line numbers, file paths only, or match counts.\n\nFile search (target='files'): Find files by glob pattern (e.g., '*.py', '*config*'). Also use this instead of ls — results sorted by modification time.\n\nNOTE: by default results EXCLUDE .gitignore'd paths, so runtime artifacts (notes/, logs, generated files) won't appear. To find or grep those — e.g. the audit ledger under notes/audits/ — set include_ignored=true.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1296,7 +1327,8 @@ SEARCH_FILES_SCHEMA = {
             "limit": {"type": "integer", "description": "Maximum number of results to return (default: 50)", "default": 50},
             "offset": {"type": "integer", "description": "Skip first N results for pagination (default: 0)", "default": 0},
             "output_mode": {"type": "string", "enum": ["content", "files_only", "count"], "description": "Output format for grep mode: 'content' shows matching lines with line numbers, 'files_only' lists file paths, 'count' shows match counts per file", "default": "content"},
-            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0}
+            "context": {"type": "integer", "description": "Number of context lines before and after each match (grep mode only)", "default": 0},
+            "include_ignored": {"type": "boolean", "description": "Also search .gitignore'd runtime dirs (e.g. notes/), excluding build/cache noise like node_modules and venv. Default false. Set true to find generated/runtime files such as the notes/audits/ ledger.", "default": False}
         },
         "required": ["pattern"]
     }
@@ -1352,7 +1384,8 @@ def _handle_search_files(args, **kw):
     return search_tool(
         pattern=args.get("pattern", ""), target=target, path=args.get("path", "."),
         file_glob=args.get("file_glob"), limit=args.get("limit", 50), offset=args.get("offset", 0),
-        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid)
+        output_mode=args.get("output_mode", "content"), context=args.get("context", 0), task_id=tid,
+        include_ignored=args.get("include_ignored", False))
 
 
 registry.register(name="read_file", toolset="file", schema=READ_FILE_SCHEMA, handler=_handle_read_file, check_fn=_check_file_reqs, emoji="📖", max_result_size_chars=100_000)
