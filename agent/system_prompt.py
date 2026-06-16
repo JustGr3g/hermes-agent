@@ -97,6 +97,18 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
         # Fallback to hardcoded identity
         stable_parts.append(DEFAULT_AGENT_IDENTITY)
 
+    # [ATHENA] Athena's constitution. PURPOSE.md is the authoritative
+    # statement of her Prime Objective, drives, guardrails, and anti-goals,
+    # injected right after SOUL.md so "who she is" is followed by "what she
+    # is for". This CLI/cron assembly path (hermes chat — daily summary,
+    # daily review) previously dropped it: only the server loop
+    # (run_agent.py _build_system_prompt) wired it, so Athena's cron-invoked
+    # selves never saw the constitution. Single source of truth; no-op for
+    # non-Athena installs. Survival-grep on upgrade: PURPOSE.md.
+    _purpose_content = _r.load_purpose_md()
+    if _purpose_content:
+        stable_parts.append(_purpose_content)
+
     # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
     stable_parts.append(HERMES_AGENT_HELP_GUIDANCE)
 

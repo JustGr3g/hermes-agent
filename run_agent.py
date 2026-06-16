@@ -183,6 +183,7 @@ from agent.prompt_builder import (
     build_context_files_prompt,
     build_environment_hints,
     load_soul_md,
+    load_purpose_md,  # [ATHENA] constitution loader — survival-grep: PURPOSE.md
     TOOL_USE_ENFORCEMENT_GUIDANCE,
     TOOL_USE_ENFORCEMENT_MODELS,
     GOOGLE_MODEL_OPERATIONAL_GUIDANCE,
@@ -5174,6 +5175,16 @@ class AIAgent:
         if not _soul_loaded:
             # Fallback to hardcoded identity
             prompt_parts = [DEFAULT_AGENT_IDENTITY]
+
+        # [ATHENA] Athena's constitution. PURPOSE.md is the authoritative
+        # statement of her Prime Objective, drives, guardrails, and anti-goals.
+        # Injected as a primary identity layer right after SOUL.md so "who she
+        # is" is immediately followed by "what she is for". Single source of
+        # truth (do NOT duplicate into SOUL.md). No-op for non-Athena installs
+        # (no PURPOSE.md). Survival-grep on upgrade: PURPOSE.md.
+        _purpose_content = load_purpose_md()
+        if _purpose_content:
+            prompt_parts.append(_purpose_content)
 
         # Pointer to the hermes-agent skill + docs for user questions about Hermes itself.
         prompt_parts.append(HERMES_AGENT_HELP_GUIDANCE)

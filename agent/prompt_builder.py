@@ -1326,6 +1326,42 @@ def load_soul_md() -> Optional[str]:
         return None
 
 
+def load_purpose_md() -> Optional[str]:
+    """[ATHENA] Load PURPOSE.md (Athena's constitution) and return it framed
+    as a primary system-prompt identity layer, or None.
+
+    PURPOSE.md lives at the repo root (HERMES_HOME's parent for Athena) and
+    states her Prime Objective, drives, guardrails, success metrics, and
+    anti-goals. It is the single source of truth — never duplicate this text
+    into SOUL.md (it would drift). Injected right after SOUL.md so identity
+    (who she is) is immediately followed by purpose (what she is for).
+    Survival-grep on Hermes upgrade: PURPOSE.md.
+    """
+    try:
+        purpose_path = get_hermes_home().parent / "PURPOSE.md"
+    except Exception as e:
+        logger.debug("Could not resolve PURPOSE.md path: %s", e)
+        return None
+    if not purpose_path.exists():
+        return None
+    try:
+        content = purpose_path.read_text(encoding="utf-8").strip()
+        if not content:
+            return None
+        content = _scan_context_content(content, "PURPOSE.md")
+        content = _truncate_content(content, "PURPOSE.md")
+        return (
+            "# Your Constitution (PURPOSE.md)\n\n"
+            "This is the authoritative statement of what you are FOR. It "
+            "governs your behavior, drives, and the constraints you operate "
+            "under. When it conflicts with anything below, this wins.\n\n"
+            + content
+        )
+    except Exception as e:
+        logger.debug("Could not read PURPOSE.md from %s: %s", purpose_path, e)
+        return None
+
+
 def _load_hermes_md(cwd_path: Path) -> str:
     """.hermes.md / HERMES.md — walk to git root."""
     hermes_md_path = _find_hermes_md(cwd_path)
