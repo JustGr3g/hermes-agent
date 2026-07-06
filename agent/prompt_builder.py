@@ -1327,38 +1327,32 @@ def load_soul_md() -> Optional[str]:
 
 
 def load_purpose_md() -> Optional[str]:
-    """[ATHENA] Load PURPOSE.md (Athena's constitution) and return it framed
-    as a primary system-prompt identity layer, or None.
+    """[ATHENA] Athena's governing documents, framed as a primary system-prompt
+    identity layer, or None.
 
-    PURPOSE.md lives at the repo root (HERMES_HOME's parent for Athena) and
-    states her Prime Objective, drives, guardrails, success metrics, and
-    anti-goals. It is the single source of truth — never duplicate this text
-    into SOUL.md (it would drift). Injected right after SOUL.md so identity
-    (who she is) is immediately followed by purpose (what she is for).
-    Survival-grep on Hermes upgrade: PURPOSE.md.
+    As of 2026-06-16 the constitution is split into PURPOSE.md (teleology) +
+    CHARTER.md (operating rules/guardrails) + RUBRIC.md (audit rubric). This
+    layer injects PURPOSE + CHARTER (NOT the auditor-facing RUBRIC), right after
+    SOUL.md, so identity → purpose → operating rules. The loading + framing is
+    single-sourced in ``cognitive_agent.purpose`` (do NOT re-read the files here;
+    that's the two-loader drift the consolidation removed). This wrapper adds
+    only hermes content-safety (prompt-injection scan + length cap).
+    Survival-grep on Hermes upgrade: PURPOSE.md, CHARTER.md.
     """
     try:
-        purpose_path = get_hermes_home().parent / "PURPOSE.md"
+        from cognitive_agent.purpose import constitution_block
     except Exception as e:
-        logger.debug("Could not resolve PURPOSE.md path: %s", e)
-        return None
-    if not purpose_path.exists():
+        logger.debug("Could not import cognitive_agent.purpose: %s", e)
         return None
     try:
-        content = purpose_path.read_text(encoding="utf-8").strip()
+        content = constitution_block()  # PURPOSE + CHARTER, already framed
         if not content:
             return None
         content = _scan_context_content(content, "PURPOSE.md")
         content = _truncate_content(content, "PURPOSE.md")
-        return (
-            "# Your Constitution (PURPOSE.md)\n\n"
-            "This is the authoritative statement of what you are FOR. It "
-            "governs your behavior, drives, and the constraints you operate "
-            "under. When it conflicts with anything below, this wins.\n\n"
-            + content
-        )
+        return content
     except Exception as e:
-        logger.debug("Could not read PURPOSE.md from %s: %s", purpose_path, e)
+        logger.debug("Could not build constitution block: %s", e)
         return None
 
 

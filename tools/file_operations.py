@@ -355,6 +355,18 @@ class FileOperations(ABC):
 # Image extensions (subset of binary that we can return as base64)
 IMAGE_EXTENSIONS = {'.png', '.jpg', '.jpeg', '.gif', '.webp', '.bmp', '.ico'}
 
+# Build/cache/runtime dirs kept OUT of results even when search_files is
+# called with include_ignored=True (which bypasses .gitignore so Athena can
+# discover its own runtime note store, e.g. notes/). Without these, a
+# --no-ignore-vcs search floods with node_modules / virtualenvs / caches.
+# Survival-grep anchor on Hermes upgrade: "include_ignored".
+_INCLUDE_IGNORED_NOISE_GLOBS = (
+    "!node_modules", "!.git", "!**/venv/**", "!**/.venv/**",
+    "!**/site-packages/**", "!__pycache__", "!**/__pycache__/**",
+    "!*.db", "!*.db-shm", "!*.db-wal", "!dist", "!build",
+    "!.pytest_cache", "!*.lock",
+)
+
 # Shell-based linters by file extension.  Invoked via _exec() with the
 # filesystem path.  Cover languages where a compile/type check needs an
 # external toolchain (py_compile, node, tsc, go vet, rustfmt).
@@ -1596,12 +1608,26 @@ class ShellFileOperations(FileOperations):
     # SEARCH Implementation
     # =========================================================================
     
+    def _ignore_override_tokens(self, include_ignored: bool) -> list:
+        """Ripgrep flags that bypass .gitignore for runtime dirs (e.g.
+        notes/) while still excluding build/cache noise. Empty list unless
+        include_ignored is set. Glob values are shell-escaped; flag tokens
+        are not (they get joined into the command line as-is).
+        Survival-grep anchor on Hermes upgrade: "include_ignored"."""
+        if not include_ignored:
+            return []
+        tokens = ["--no-ignore-vcs"]
+        for g in _INCLUDE_IGNORED_NOISE_GLOBS:
+            tokens.extend(["--glob", self._escape_shell_arg(g)])
+        return tokens
+
     def search(self, pattern: str, path: str = ".", target: str = "content",
                file_glob: Optional[str] = None, limit: int = 50, offset: int = 0,
-               output_mode: str = "content", context: int = 0) -> SearchResult:
+               output_mode: str = "content", context: int = 0,
+               include_ignored: bool = False) -> SearchResult:
         """
         Search for content or files.
-        
+
         Args:
             pattern: Regex (for content) or glob pattern (for files)
             path: Directory/file to search (default: cwd)
@@ -1611,7 +1637,9 @@ class ShellFileOperations(FileOperations):
             offset: Skip first N results
             output_mode: "content", "files_only", or "count"
             context: Lines of context around matches
-        
+            include_ignored: Also search .gitignore'd runtime dirs (e.g.
+                notes/), excluding build/cache noise. Default False.
+
         Returns:
             SearchResult with matches or file list
         """
@@ -1654,12 +1682,13 @@ class ShellFileOperations(FileOperations):
             )
         
         if target == "files":
-            return self._search_files(pattern, path, limit, offset)
+            return self._search_files(pattern, path, limit, offset, include_ignored)
         else:
-            return self._search_content(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
-    
-    def _search_files(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+            return self._search_content(pattern, path, file_glob, limit, offset,
+                                        output_mode, context, include_ignored)
+
+    def _search_files(self, pattern: str, path: str, limit: int, offset: int,
+                      include_ignored: bool = False) -> SearchResult:
         """Search for files by name pattern (glob-like)."""
         # Auto-prepend **/ for recursive search if not already present
         if not pattern.startswith('**/') and '/' not in pattern:
@@ -1677,7 +1706,8 @@ class ShellFileOperations(FileOperations):
         # default, and has parallel directory traversal (~200x faster than
         # find on wide trees).  Mirrors _search_content which already uses rg.
         if self._has_command('rg'):
-            return self._search_files_rg(search_pattern, path, limit, offset)
+            return self._search_files_rg(search_pattern, path, limit, offset,
+                                         include_ignored)
 
         # Fallback: find (slower, no .gitignore awareness)
         if not self._has_command('find'):
@@ -1741,13 +1771,16 @@ class ShellFileOperations(FileOperations):
             total_count=len(files)
         )
 
-    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int) -> SearchResult:
+    def _search_files_rg(self, pattern: str, path: str, limit: int, offset: int,
+                         include_ignored: bool = False) -> SearchResult:
         """Search for files by name using ripgrep's --files mode.
 
         rg --files respects .gitignore and excludes hidden directories by
         default, and uses parallel directory traversal for ~200x speedup
         over find on wide trees.  Results are sorted by modification time
         (most recently edited first) when rg >= 13.0 supports --sortr.
+        When include_ignored is set, gitignore'd runtime dirs (e.g. notes/)
+        are also searched, minus build/cache noise.
         """
         # rg --files -g uses glob patterns; wrap bare names so they match
         # at any depth (equivalent to find -name).
@@ -1756,10 +1789,11 @@ class ShellFileOperations(FileOperations):
         else:
             glob_pattern = pattern
 
+        override = " ".join(self._ignore_override_tokens(include_ignored))
         fetch_limit = limit + offset
         # Try mtime-sorted first (rg 13+); fall back to unsorted if not supported.
         cmd_sorted = (
-            f"rg --files --sortr=modified -g {self._escape_shell_arg(glob_pattern)} "
+            f"rg --files --sortr=modified {override} -g {self._escape_shell_arg(glob_pattern)} "
             f"{self._escape_shell_arg(path)} 2>/dev/null "
             f"| head -n {fetch_limit}"
         )
@@ -1769,7 +1803,7 @@ class ShellFileOperations(FileOperations):
         if not all_files:
             # --sortr may have failed on older rg; retry without it.
             cmd_plain = (
-                f"rg --files -g {self._escape_shell_arg(glob_pattern)} "
+                f"rg --files {override} -g {self._escape_shell_arg(glob_pattern)} "
                 f"{self._escape_shell_arg(path)} 2>/dev/null "
                 f"| head -n {fetch_limit}"
             )
@@ -1785,13 +1819,16 @@ class ShellFileOperations(FileOperations):
         )
     
     def _search_content(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+                        limit: int, offset: int, output_mode: str, context: int,
+                        include_ignored: bool = False) -> SearchResult:
         """Search for content inside files (grep-like)."""
         # Try ripgrep first (fast), fallback to grep (slower but works)
         if self._has_command('rg'):
-            return self._search_with_rg(pattern, path, file_glob, limit, offset, 
-                                        output_mode, context)
+            return self._search_with_rg(pattern, path, file_glob, limit, offset,
+                                        output_mode, context, include_ignored)
         elif self._has_command('grep'):
+            # grep -r has no .gitignore awareness, so it already reaches
+            # ignored dirs; include_ignored is a no-op on this fallback path.
             return self._search_with_grep(pattern, path, file_glob, limit, offset,
                                           output_mode, context)
         else:
@@ -1802,10 +1839,15 @@ class ShellFileOperations(FileOperations):
             )
     
     def _search_with_rg(self, pattern: str, path: str, file_glob: Optional[str],
-                        limit: int, offset: int, output_mode: str, context: int) -> SearchResult:
+                        limit: int, offset: int, output_mode: str, context: int,
+                        include_ignored: bool = False) -> SearchResult:
         """Search using ripgrep."""
         cmd_parts = ["rg", "--line-number", "--no-heading", "--with-filename"]
-        
+
+        # Bypass .gitignore for runtime dirs (e.g. notes/) when requested,
+        # minus build/cache noise. No-op unless include_ignored is set.
+        cmd_parts.extend(self._ignore_override_tokens(include_ignored))
+
         # Add context if requested
         if context > 0:
             cmd_parts.extend(["-C", str(context)])

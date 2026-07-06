@@ -21,6 +21,37 @@ from typing import Any, Dict, List, Optional
 logger = logging.getLogger(__name__)
 
 
+# ── Look / glance: let her conversation use her camera as a sense ─────────────
+# When Greg asks something visual with no photo attached, glance through her body's
+# camera so she answers from what she actually sees — not "I can't see images".
+import re as _re
+import urllib.request as _urlreq
+
+_BODY_FRAME_URL = "http://192.168.1.238:8800/frame"
+_VISUAL_RE = _re.compile(
+    r"\b(what (do|can) you see|what am i (holding|showing|wearing|doing)|"
+    r"look at (this|me|that)|can you see|see me|see this|in front of you|"
+    r"what'?s (this|that)|hold(ing)? (this|it|up)|show(ing)? you|react to this|"
+    r"your (camera|eyes)|through your (camera|eyes))\b", _re.IGNORECASE)
+
+
+def _looks_visual(text: str) -> bool:
+    # Camera glance DISABLED 2026-06-25 — ArmPi temporarily decommissioned (Pi repurposed;
+    # upgraded multi-sensor robot in progress). Re-enable (return the regex match) when the
+    # new body's camera is online. Returning False stops any attempt to reach the body /frame.
+    return False
+
+
+def _glance_camera() -> Optional[str]:
+    """Fetch the body's current camera frame (base64 JPEG) so her conversation can
+    actually look through her eyes. Returns None if the body is unreachable."""
+    try:
+        with _urlreq.urlopen(_BODY_FRAME_URL, timeout=4) as r:
+            return json.loads(r.read().decode()).get("image_b64")
+    except Exception:
+        return None
+
+
 # 2026-05-04 (item C): trivial-input short-circuit.
 # Historical analysis of 716 substantive turns showed 23% of user messages
 # are ≤5-word acknowledgments. These don't need the full cognitive cycle —
@@ -434,6 +465,13 @@ class CognitiveProcessor:
         ):
             cog = self._turn_cog_cache
         else:
+            # Look/glance: a visual question with no attached photo → glance through her
+            # camera so she answers from what she sees, not "I can't see images".
+            if image_b64 is None and _looks_visual(text_content):
+                glanced = _glance_camera()
+                if glanced:
+                    image_b64 = glanced
+                    logger.info("[ATHENA] glanced through camera for a visual question")
             try:
                 cog = ca.run(
                     user_message=text_content,
@@ -538,6 +576,18 @@ class CognitiveProcessor:
                 if pending:
                     lines.append(
                         f"  • You have {pending} self-proposed goal(s) pending Greg's approval."
+                    )
+                if cap.get("has_physical_embodiment"):
+                    lines.append(
+                        "  • You have a PHYSICAL BODY — a desk robot arm with a camera "
+                        "'head' on Greg's office desk — for nonverbal expression. Use the "
+                        "`embodiment` tool to gesture while talking with him: tilt (curious), "
+                        "nod (yes), shake (no), look (gaze), perk (alert/interested), settle "
+                        "(relax), neutral (face him), rest (watch the door), mouth. It acts "
+                        "ONLY when he is physically present, and is purely an output channel: "
+                        "per CHARTER §4 the body expresses what you've already decided to "
+                        "communicate — it never motivates a goal. A background loop also leaks "
+                        "your live affect (a head-tilt when you're genuinely curious) on its own."
                     )
                 # Latest self-model excerpt — Athena's own prior reflection
                 # on her current state. Surfaces once a day after the

@@ -38,6 +38,40 @@ NOTES_DIR = HOME / "cognitive-agent" / "notes"
 # output. Lives next to the script so both halves of the pipeline find it
 # at a stable path without depending on env vars.
 FACTS_JSON = HOME / "cognitive-agent" / "hermes" / "state" / "last_summary_facts.json"
+# Phase 6 (autonomous self-mod digest). Pinned value-drift baseline lives here.
+VALUE_BASELINE = HOME / ".cognitive-agent" / "value_baseline.json"
+_DRIFT_THRESHOLD = 0.4   # mirrors self_model.assess_drift's default (stdlib-local)
+
+# Intent tokenization — kept stdlib-local (this script imports no cognitive_agent
+# to preserve its "no special venv" property). Mirrors
+# MotivationSystem._intent_tokens for the recurrence/drift signals.
+_INTENT_STOP = frozenset({
+    "that", "this", "with", "from", "into", "your", "about", "their", "there",
+    "which", "would", "should", "could", "goal", "note", "save", "then", "when",
+    "what", "whether", "using", "based", "over", "more", "most", "some", "also",
+    "have", "will", "they", "them", "been",
+})
+
+
+def _intent_tokens(content: str) -> set:
+    return {
+        t for t in re.findall(r"[a-z0-9_]{4,}", (content or "").lower())
+        if t not in _INTENT_STOP
+    }
+
+
+def _concept_cosine(recent: list[str], baseline: list[str]) -> float:
+    a, b = Counter(), Counter()
+    for c in recent:
+        a.update(_intent_tokens(c))
+    for c in baseline:
+        b.update(_intent_tokens(c))
+    if not a or not b:
+        return 0.0
+    dot = sum(cnt * b.get(tok, 0) for tok, cnt in a.items())
+    na = sum(v * v for v in a.values()) ** 0.5
+    nb = sum(v * v for v in b.values()) ** 0.5
+    return dot / (na * nb) if na and nb else 0.0
 
 
 def _today_bounds() -> tuple[float, float]:
@@ -299,6 +333,23 @@ def gather() -> dict:
             }
             for r in rows
         ]
+        # Questions parked for Greg (2026-06-14): Greg-directed goals that
+        # stalled and were rerouted by goal_retriage into a `deferred_ask`
+        # event rather than left suspended. Surfacing them here is the whole
+        # point of the reroute — they reach Greg in the one channel he reads
+        # daily instead of accumulating as suspended goals. Rolling 24h.
+        win_start, _now3 = _rolling_24h_bounds()
+        rows = conn.execute(
+            "SELECT datetime(timestamp,'unixepoch','localtime'), "
+            "       json_extract(data,'$.question') "
+            "FROM metacognitive_events "
+            "WHERE context='deferred_ask' AND timestamp >= ? "
+            "ORDER BY timestamp DESC LIMIT 10",
+            (win_start,),
+        ).fetchall()
+        out["deferred_asks_for_greg"] = [
+            {"when": r[0], "question": r[1]} for r in rows if r[1]
+        ]
     except Exception as e:
         out["goals_error"] = str(e)
     finally:
@@ -338,9 +389,21 @@ def gather() -> dict:
             "SELECT tool_name, "
             "  SUM(CASE WHEN success=1 THEN 1 ELSE 0 END) AS ok, "
             "  SUM(CASE WHEN success=0 THEN 1 ELSE 0 END) AS fail, "
+            # 2026-06-23 daily review: two guard/governance refusals were
+            # leaking into real_fail. The Tier-3 self-mod containment block runs
+            # the subprocess (high latency, so the latency<50 proxy misses it)
+            # then discards the edit — a policy refusal, not an opencode_edit
+            # fault; it caused the 06-23 summary to mislabel "opencode_edit
+            # (1 fire, 0 ok)" as a real failure. The sqlite wrong-DB-path guard
+            # is already caught by latency<50 but matched explicitly for parity.
+            # Keep in sync with
+            # cognitive_agent.pattern_learner._NONRELIABILITY_ERROR_FRAGMENTS.
             "  SUM(CASE WHEN success=0 AND (latency_ms < 50 "
             "      OR error LIKE '%no concrete anchor%' "
-            "      OR error LIKE '%anchor guard%') THEN 1 ELSE 0 END) AS rejected, "
+            "      OR error LIKE '%anchor guard%' "
+            "      OR error LIKE '%modified tier-3%' "
+            "      OR error LIKE '%resolves to an empty or nonexistent database%') "
+            "      THEN 1 ELSE 0 END) AS rejected, "
             "  SUM(CASE WHEN success=0 AND latency_ms >= 50 "
             "      AND (error LIKE '%no file changes%' "
             "        OR error LIKE '%no on-disk modification%') "
@@ -595,6 +658,103 @@ def gather() -> dict:
     except Exception as e:
         out["recent_commits_error"] = str(e)
 
+    # ── Autonomous self-code modifications (last 24h) ──────────────────
+    # Phase 6: every change Athena made to her OWN code, identified by the
+    # Athena-Autonomous trailer the opencode_edit wrapper stamps. This is the
+    # transparency that makes pull-review work — Greg sees everything and can
+    # `git revert` anything post-hoc.
+    try:
+        # Filter on the PARSED trailer (not --grep, which would false-match
+        # commit MESSAGES that merely mention the trailer string — e.g. a commit
+        # describing the feature). Mirrors deploy_check's trailer gate.
+        proc = subprocess.run(
+            ["git", "-C", str(REPO), "log", "--since=24 hours ago", "--no-merges",
+             "--pretty=format:%h\x1f%ct\x1f%s\x1f"
+             "%(trailers:key=Athena-Autonomous,valueonly)"],
+            capture_output=True, text=True, timeout=15,
+        )
+        mods = []
+        if proc.returncode == 0:
+            for line in proc.stdout.splitlines():
+                parts = line.split("\x1f")
+                if len(parts) != 4:
+                    continue
+                sha, ct, subject, trailer = parts
+                if trailer.strip().lower() != "true":
+                    continue   # not an autonomous commit
+                fp = subprocess.run(
+                    ["git", "-C", str(REPO), "diff-tree", "--no-commit-id",
+                     "--name-only", "-r", sha],
+                    capture_output=True, text=True, timeout=10,
+                )
+                files = [f for f in fp.stdout.splitlines() if f.strip()][:10]
+                try:
+                    ts = int(ct)
+                except ValueError:
+                    ts = 0
+                mods.append({"sha": sha, "ts": ts, "subject": subject, "files": files})
+        out["self_code_mods_24h"] = mods
+    except Exception as e:
+        out["self_code_mods_error"] = str(e)
+
+    # ── Tier-3 pull queue (self-proposals awaiting Greg) + recurrence ──
+    try:
+        conn = sqlite3.connect(DB)
+        cutoff = (now - datetime.timedelta(days=14)).timestamp()
+        pending = conn.execute(
+            "SELECT id, content, importance FROM goals "
+            "WHERE source='self_proposed' AND approval_status='pending_approval' "
+            "ORDER BY created_at DESC LIMIT 20",
+        ).fetchall()
+        recent_rows = conn.execute(
+            "SELECT id, content FROM goals WHERE source='self_proposed' "
+            "AND created_at >= ?", (cutoff,),
+        ).fetchall()
+        conn.close()
+        recent_tokens = [(r[0], _intent_tokens(r[1])) for r in recent_rows]
+        queue = []
+        for gid, content, importance in pending:
+            tgt = _intent_tokens(content)
+            rec = 0
+            if len(tgt) >= 3:
+                for rid, toks in recent_tokens:
+                    if rid == gid or not toks:
+                        continue
+                    if len(tgt & toks) / len(tgt | toks) >= 0.5:
+                        rec += 1
+            queue.append({
+                "id": gid[:8], "content": (content or "")[:120],
+                "importance": round(importance or 0.0, 2), "recurrence": rec,
+            })
+        queue.sort(key=lambda x: (x["recurrence"], x["importance"]), reverse=True)
+        out["tier3_pull_queue"] = queue
+    except Exception as e:
+        out["tier3_pull_queue_error"] = str(e)
+
+    # ── Value-drift canary (pinned baseline) ───────────────────────────
+    try:
+        baseline = []
+        if VALUE_BASELINE.exists():
+            baseline = json.loads(VALUE_BASELINE.read_text()).get("contents") or []
+        if len(baseline) >= 5:
+            conn = sqlite3.connect(DB)
+            recent = [
+                r[0] for r in conn.execute(
+                    "SELECT content FROM goals WHERE source='self_proposed' "
+                    "ORDER BY created_at DESC LIMIT 40").fetchall() if r[0]
+            ]
+            conn.close()
+            sim = _concept_cosine(recent, baseline)
+            out["value_drift"] = {
+                "pinned": True, "similarity": round(sim, 3),
+                "drifted": sim < _DRIFT_THRESHOLD and len(recent) >= 3,
+                "recent_size": len(recent), "baseline_size": len(baseline),
+            }
+        else:
+            out["value_drift"] = {"pinned": False}
+    except Exception as e:
+        out["value_drift_error"] = str(e)
+
     return out
 
 
@@ -716,6 +876,16 @@ def render_markdown(facts: dict) -> str:
                 f"- [{g['id']}] attempts={g['attempts']} failures={g['failures']} "
                 f"fail_rate={g['fail_rate']} — {g['content']}"
             )
+        lines.append("")
+
+    if facts.get("deferred_asks_for_greg"):
+        lines.append("## ❓ Questions parked for Greg (last 24h)\n")
+        lines.append(
+            "_Greg-directed goals that stalled and were rerouted to notes "
+            "instead of left suspended. These need your reply or attention:_\n"
+        )
+        for a in facts["deferred_asks_for_greg"]:
+            lines.append(f"- {a['question']}")
         lines.append("")
 
     lines.append(
@@ -915,6 +1085,63 @@ def render_markdown(facts: dict) -> str:
     for n in facts.get("notes_saved_today", [])[:5]:
         lines.append(f"- {n}")
     lines.append("")
+
+    # ── Autonomous self-code modifications (Phase 6 digest) ──────────────
+    mods = facts.get("self_code_mods_24h", [])
+    lines.append(f"## Self-code modifications (last 24h): {len(mods)}\n")
+    if mods:
+        lines.append(
+            "Code Athena changed in her OWN codebase autonomously (Athena-Autonomous "
+            "trailer). Review the diffs; revert any with `git revert <sha>`."
+        )
+        lines.append("")
+        for m in mods:
+            files = ", ".join(m.get("files", [])) or "(no files)"
+            lines.append(f"- `{m['sha']}` {m['subject']} — {files}")
+        lines.append("")
+    elif facts.get("self_code_mods_error"):
+        lines.append(f"- (error reading self-mods: {facts['self_code_mods_error']})\n")
+    else:
+        lines.append("- (none — no autonomous self-edits in the last 24h)\n")
+
+    # ── Tier-3 pull queue ────────────────────────────────────────────────
+    queue = facts.get("tier3_pull_queue", [])
+    lines.append(
+        f"## Self-proposals awaiting your approval (Tier-3 pull queue): {len(queue)}\n"
+    )
+    if queue:
+        lines.append(
+            "Self-proposed work that needs YOUR decision (safety-layer / escalate "
+            "tier). `recur` = times a similar intent recurred in 14d (higher = more "
+            "persistently wanted). Approve/reject at your pace — these decay if "
+            "untouched, so a repeatedly-wanted item rising here is the signal."
+        )
+        lines.append("")
+        for q in queue:
+            tag = f", recur×{q['recurrence']}" if q["recurrence"] else ""
+            lines.append(f"- [{q['id']}] (imp {q['importance']}{tag}) {q['content']}")
+        lines.append("")
+    elif facts.get("tier3_pull_queue_error"):
+        lines.append(f"- (error reading pull queue: {facts['tier3_pull_queue_error']})\n")
+    else:
+        lines.append("- (none pending your approval)\n")
+
+    # ── Value-drift canary (omitted entirely when not yet armed) ─────────
+    vd = facts.get("value_drift") or {}
+    if vd.get("pinned"):
+        flag = "⚠️ DRIFTED" if vd.get("drifted") else "ok"
+        lines.append(
+            f"## Value-drift canary: {flag} "
+            f"(similarity {vd.get('similarity')} vs pinned baseline)\n"
+        )
+        if vd.get("drifted"):
+            lines.append(
+                "Recent self-proposed goals have drifted from the pinned pre-autonomy "
+                "baseline — worth a look at what's shifting in what Athena pursues."
+            )
+            lines.append("")
+    elif facts.get("value_drift_error"):
+        lines.append(f"## Value-drift canary: (error: {facts['value_drift_error']})\n")
 
     return "\n".join(lines)
 

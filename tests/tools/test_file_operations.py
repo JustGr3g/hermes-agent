@@ -498,6 +498,61 @@ class TestSearchPathValidation:
         assert result.error is not None
         assert "search failed" in result.error.lower() or "Search error" in result.error
 
+    # ------------------------------------------------------------------
+    # include_ignored: let search reach .gitignore'd runtime dirs (notes/)
+    # without flooding node_modules/venv. Regression anchor for the
+    # notes/audits discovery gap. Survival-grep on upgrade: include_ignored.
+    # ------------------------------------------------------------------
+    def _capture_rg_commands(self, mock_env):
+        """Wire mock_env so rg runs (no matches) and every command is logged."""
+        commands = []
+        def side_effect(command, **kwargs):
+            commands.append(command)
+            if "test -e" in command:
+                return {"output": "exists", "returncode": 0}
+            if "command -v" in command:
+                return {"output": "yes", "returncode": 0}
+            return {"output": "", "returncode": 1}  # rg: no matches
+        mock_env.execute.side_effect = side_effect
+        return commands
+
+    def _rg_cmd(self, commands):
+        return next(c for c in commands if c.lstrip().startswith("rg "))
+
+    def test_content_search_default_respects_gitignore(self, mock_env):
+        """Default content search must NOT pass ignore-bypass flags."""
+        commands = self._capture_rg_commands(mock_env)
+        ShellFileOperations(mock_env).search("foo", path="/p", target="content")
+        cmd = self._rg_cmd(commands)
+        assert "--no-ignore-vcs" not in cmd
+        assert "node_modules" not in cmd
+
+    def test_content_search_include_ignored_bypasses_with_noise_excludes(self, mock_env):
+        """include_ignored content search bypasses gitignore but excludes noise."""
+        commands = self._capture_rg_commands(mock_env)
+        ShellFileOperations(mock_env).search(
+            "foo", path="/p", target="content", include_ignored=True)
+        cmd = self._rg_cmd(commands)
+        assert "--no-ignore-vcs" in cmd
+        assert "node_modules" in cmd          # noise exclusion present
+        assert "site-packages" in cmd
+
+    def test_files_search_default_no_ignore_bypass(self, mock_env):
+        """Default file-name search must NOT pass --no-ignore-vcs."""
+        commands = self._capture_rg_commands(mock_env)
+        ShellFileOperations(mock_env).search("*.md", path="/p", target="files")
+        cmd = self._rg_cmd(commands)
+        assert "--no-ignore-vcs" not in cmd
+
+    def test_files_search_include_ignored_adds_bypass(self, mock_env):
+        """include_ignored file-name search adds the ignore-bypass flags."""
+        commands = self._capture_rg_commands(mock_env)
+        ShellFileOperations(mock_env).search(
+            "*.md", path="/p", target="files", include_ignored=True)
+        cmd = self._rg_cmd(commands)
+        assert "--no-ignore-vcs" in cmd
+        assert "node_modules" in cmd
+
 
 class TestSearchFilesFallbackHiddenPaths:
     def _make_env(self):
