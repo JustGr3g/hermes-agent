@@ -481,11 +481,12 @@ approvals:
   mcp_reload_confirm: true
   destructive_slash_confirm: true
 command_allowlist:
-- kill process via pgrep expansion (self-termination)
 - script execution via heredoc
-- script execution via -e/-c flag
 - delete in root path
+- git reset --hard (destroys uncommitted changes)
 - shell command via -c/-lc flag
+- kill process via pgrep expansion (self-termination)
+- script execution via -e/-c flag
 quick_commands: {}
 hooks: {}
 hooks_auto_accept: false
