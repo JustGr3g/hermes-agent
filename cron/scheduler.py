@@ -1413,23 +1413,8 @@ def _run_job_impl(job: dict) -> tuple[bool, str, str, Optional[str]]:
     if _process_name:
         logger.info("Job '%s': running process '%s'", job_name, _process_name)
         try:
-            # The gateway process runs with cwd=hermes/, where a gitignored
-            # namespace fragment (hermes/cognitive_agent/) shadows the real
-            # repo-root cognitive_agent package and lacks the processes/
-            # subpackage (relocated into cognitive_agent.processes 2026-07-08).
-            # Ensure the repo root is importable so cognitive_agent.processes
-            # resolves; and if the shadowing fragment was already imported into
-            # sys.modules, extend its __path__ so the submodule lookup finds the
-            # real processes/ dir instead of raising ModuleNotFoundError.
-            _repo_root = str(Path(__file__).resolve().parent.parent.parent)
-            if _repo_root not in sys.path:
-                sys.path.insert(0, _repo_root)
-            _ca = sys.modules.get("cognitive_agent")
-            if _ca is not None and hasattr(_ca, "__path__"):
-                _ca_real = os.path.join(_repo_root, "cognitive_agent")
-                if _ca_real not in list(_ca.__path__):
-                    _ca.__path__.append(_ca_real)
-
+            # cognitive_agent lives one level up from the hermes/ fork and is
+            # put on sys.path by hermes_cli.main at boot (the application root).
             from cognitive_agent.processes.registry import process_registry
             import cognitive_agent.processes.daily_summary  # noqa: F401 — trigger registration
 

@@ -203,6 +203,20 @@ def _require_tty(command_name: str) -> None:
 PROJECT_ROOT = Path(__file__).parent.parent.resolve()
 sys.path.insert(0, str(PROJECT_ROOT))
 
+# Add the *application* root (parent of the hermes/ fork) to the path so the
+# real cognitive_agent package is importable from this process. The gateway
+# runs with cwd=hermes/, and hermes/ is a vendored sub-tree of the wider app
+# whose cognitive_agent/ (with the .processes cron pipeline, heartbeat
+# handlers, etc.) lives one level up. Appended, not inserted: it can only add
+# names that nothing earlier resolves (cognitive_agent), never shadow a fork
+# module. Without this the cron scheduler's `import cognitive_agent.processes`
+# fails with ModuleNotFoundError in the gateway process.
+_APP_ROOT = PROJECT_ROOT.parent
+if (_APP_ROOT / "cognitive_agent" / "__init__.py").is_file():
+    _app_root_str = str(_APP_ROOT)
+    if _app_root_str not in sys.path:
+        sys.path.append(_app_root_str)
+
 
 # ---------------------------------------------------------------------------
 # Profile override — MUST happen before any hermes module import.
